@@ -334,7 +334,7 @@ def main():
     saved_state = db.get_monitor_state()
     failed_over = saved_state["failed_over"]
     last_action_time = saved_state["last_action_time"]
-    primary_healthy_since = saved_state["primary_healthy_since"]
+    primary_healthy_since = saved_state.get("primary_healthy_since")
     if failed_over:
         log.warning(
             "Resuming with failed_over=True from persisted state (last action at %s) -- "

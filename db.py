@@ -49,7 +49,8 @@ CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
 CREATE TABLE IF NOT EXISTS monitor_state (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     failed_over INTEGER NOT NULL DEFAULT 0,
-    last_action_time REAL NOT NULL DEFAULT 0
+    last_action_time REAL NOT NULL DEFAULT 0,
+    primary_healthy_since REAL
 );
 """
 
@@ -69,6 +70,12 @@ def _connect():
 def init_db():
     with _connect() as conn:
         conn.executescript(_SCHEMA)
+        # Migration: monitor_state existed before primary_healthy_since was
+        # added. CREATE TABLE IF NOT EXISTS won't add columns to an already-
+        # existing table, so add it explicitly if missing.
+        cols = [row[1] for row in conn.execute("PRAGMA table_info(monitor_state)").fetchall()]
+        if "primary_healthy_since" not in cols:
+            conn.execute("ALTER TABLE monitor_state ADD COLUMN primary_healthy_since REAL")
 
 
 def insert_cycle(ts: float, avg_latency_ms: float, loss_pct: float, is_bad: bool, throughput_mbps=None):
@@ -96,25 +103,32 @@ def prune_old_rows():
 
 
 def get_monitor_state() -> dict:
-    """Returns {'failed_over': bool, 'last_action_time': float}, defaulting
-    to a fresh/never-failed-over state if no row exists yet."""
+    """Returns {'failed_over': bool, 'last_action_time': float,
+    'primary_healthy_since': float or None}, defaulting to a fresh state if
+    no row exists yet."""
     with _connect() as conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute(
-            "SELECT failed_over, last_action_time FROM monitor_state WHERE id = 1"
+            "SELECT failed_over, last_action_time, primary_healthy_since FROM monitor_state WHERE id = 1"
         ).fetchone()
         if row is None:
-            return {"failed_over": False, "last_action_time": 0.0}
-        return {"failed_over": bool(row["failed_over"]), "last_action_time": row["last_action_time"]}
+            return {"failed_over": False, "last_action_time": 0.0, "primary_healthy_since": None}
+        return {
+            "failed_over": bool(row["failed_over"]),
+            "last_action_time": row["last_action_time"],
+            "primary_healthy_since": row["primary_healthy_since"],
+        }
 
 
-def set_monitor_state(failed_over: bool, last_action_time: float):
+def set_monitor_state(failed_over: bool, last_action_time: float, primary_healthy_since=None):
     with _connect() as conn:
         conn.execute(
-            "INSERT INTO monitor_state (id, failed_over, last_action_time) VALUES (1, ?, ?) "
+            "INSERT INTO monitor_state (id, failed_over, last_action_time, primary_healthy_since) "
+            "VALUES (1, ?, ?, ?) "
             "ON CONFLICT(id) DO UPDATE SET failed_over = excluded.failed_over, "
-            "last_action_time = excluded.last_action_time",
-            (int(failed_over), last_action_time),
+            "last_action_time = excluded.last_action_time, "
+            "primary_healthy_since = excluded.primary_healthy_since",
+            (int(failed_over), last_action_time, primary_healthy_since),
         )
 
 
