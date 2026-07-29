@@ -161,6 +161,24 @@ class OmadaClient:
         path = f"/openapi/v1/{self.omadac_id}/sites/{self.site_id}/gateways/{mac}"
         return self._get(path)
 
+    def get_wan_status(self, mac: str) -> list:
+        """
+        PENDING CONFIRMATION against a real ER605 -- endpoint and schema are
+        from the Knife4j docs (category: Gateway), not yet tested live.
+
+            GET /openapi/v1/{omadacId}/sites/{siteId}/gateways/{gatewayMac}/wan-status
+
+        Returns a list of per-port status entries, each with (among many
+        other fields): port, name, type (0:WAN,1:WAN/LAN,2:LAN), status
+        (0/1 physical link), internetState (0/1 WAN connectivity),
+        onlineDetection, latency (ms), loss (%), healthLevel. This is the
+        real-time status endpoint -- unlike get_wan_ports_config() (dial-up
+        connection config) or get_internet_load_balance() (primary/backup
+        assignment), neither of which carry live health data.
+        """
+        path = f"/openapi/v1/{self.omadac_id}/sites/{self.site_id}/gateways/{mac}/wan-status"
+        return self._get(path)
+
     def get_internet_load_balance(self) -> dict:
         """
         CONFIRMED WORKING (2026-07-28) against a real ER605 on Omada Central.

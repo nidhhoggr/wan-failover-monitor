@@ -49,6 +49,40 @@ LATENCY_THRESHOLD_MS = float(os.environ.get("LATENCY_THRESHOLD_MS", "150"))
 PACKET_LOSS_THRESHOLD_PCT = float(os.environ.get("PACKET_LOSS_THRESHOLD_PCT", "15"))
 CONSECUTIVE_BAD_TO_TRIGGER = int(os.environ.get("CONSECUTIVE_BAD_TO_TRIGGER", "12"))
 CONSECUTIVE_GOOD_TO_FAILBACK = int(os.environ.get("CONSECUTIVE_GOOD_TO_FAILBACK", "24"))
+# IMPORTANT: once failed over, subsequent good cycles reflect the health of
+# whichever WAN is now ACTIVE (the backup) -- not whether the original
+# primary has recovered. There is no way for this LAN-side monitor to tell
+# those apart. Left at the default (false), CONSECUTIVE_GOOD_TO_FAILBACK
+# reaching its threshold only logs and stops counting -- it does NOT call
+# the Omada API. Fail-back should be a deliberate decision (confirmed with
+# your ISP, or after a known outage window) made via
+# `test_load_balance_swap.sh failback`, not an automatic action based on
+# unrelated telemetry. Setting this true restores fully automatic
+# fail-back and accepts the real risk of flapping onto a still-broken
+# primary the moment the backup happens to look healthy for a while.
+AUTO_FAILBACK_ENABLED = env_bool("AUTO_FAILBACK_ENABLED", False)
+
+# How often to poll the primary WAN's real status via the Omada API (a
+# separate, lower-frequency cadence than CHECK_INTERVAL_SECONDS -- this is
+# an actual API call, not a local ping, so it shouldn't run every cycle).
+PRIMARY_HEALTH_POLL_INTERVAL_SECONDS = float(os.environ.get("PRIMARY_HEALTH_POLL_INTERVAL_SECONDS", "30"))
+
+# Once the primary is reported healthy via the API, require it to stay
+# continuously healthy for this long before fail-back is even considered.
+# Any single unhealthy poll during this window resets the clock to zero.
+# Default 300s (5 min) -- deliberately conservative.
+PRIMARY_HEALTHY_STABILITY_SECONDS = float(os.environ.get("PRIMARY_HEALTHY_STABILITY_SECONDS", "300"))
+
+# "Healthy" for fail-back purposes requires internetState==1 (the router's
+# own connectivity flag) AND latency/loss from that same wan-status
+# response falling within these thresholds. Separate from
+# LATENCY_THRESHOLD_MS/PACKET_LOSS_THRESHOLD_PCT above (those gate the LAN
+# ping-based failover trigger) -- kept independent since the API-reported
+# values come from the router's own probe, not this monitor's LAN-side
+# pings, and you may reasonably want a different tolerance for "good enough
+# to trust as primary again" than for "bad enough to fail off of."
+PRIMARY_HEALTHY_LATENCY_THRESHOLD_MS = float(os.environ.get("PRIMARY_HEALTHY_LATENCY_THRESHOLD_MS", "100"))
+PRIMARY_HEALTHY_LOSS_THRESHOLD_PCT = float(os.environ.get("PRIMARY_HEALTHY_LOSS_THRESHOLD_PCT", "5"))
 # A single cycle going the "wrong" direction (e.g. one bad cycle during an
 # otherwise-clean good streak) doesn't immediately zero the streak -- it
 # takes this many CONSECUTIVE opposite-direction cycles to actually break
@@ -205,7 +239,50 @@ def update_streaks(is_bad: bool, consecutive_bad: int, consecutive_good: int, op
     return consecutive_bad, consecutive_good, opposite_streak
 
 
-def build_omada_client() -> OmadaClient:
+def check_primary_wan_health(omada: OmadaClient) -> bool:
+    """
+    CONFIRMED WORKING (2026-07-29): get_wan_status() tested against a real
+    ER605, response matched the UI exactly. This function's matching logic
+    has been unit-tested against the real confirmed response shape.
+
+    Queries the primary WAN's real status via the Omada API -- this is the
+    correct signal for fail-back decisions, unlike LAN-side ping health
+    (which only ever reflects whatever WAN is currently active).
+
+    "Healthy" requires ALL of:
+      - internetState == 1 (the router's own connectivity flag)
+      - latency <= PRIMARY_HEALTHY_LATENCY_THRESHOLD_MS
+      - loss <= PRIMARY_HEALTHY_LOSS_THRESHOLD_PCT
+    all three from the same wan-status response. internetState alone isn't
+    enough -- a WAN can report "connected" while still being the same kind
+    of degraded (high latency, lossy) that caused the original failover, so
+    fail-back needs to confirm real quality, not just link presence.
+    Missing/null latency or loss (e.g. while the port is actually down) is
+    treated as failing the check, not passing it by default.
+    """
+    port_num = int(WAN_PRIMARY_PORT_ID.split("_")[0])
+    wan_status = omada.get_wan_status(OMADA_GATEWAY_MAC)
+    for entry in wan_status:
+        if entry.get("port") == port_num:
+            internet_state = entry.get("internetState")
+            latency = entry.get("latency")
+            loss = entry.get("loss")
+            healthy = (
+                internet_state == 1
+                and latency is not None and latency <= PRIMARY_HEALTHY_LATENCY_THRESHOLD_MS
+                and loss is not None and loss <= PRIMARY_HEALTHY_LOSS_THRESHOLD_PCT
+            )
+            log.debug(
+                "primary WAN (port %s) status: internetState=%s latency=%sms (<=%s) loss=%s%% (<=%s) -> healthy=%s",
+                port_num, internet_state, latency, PRIMARY_HEALTHY_LATENCY_THRESHOLD_MS,
+                loss, PRIMARY_HEALTHY_LOSS_THRESHOLD_PCT, healthy,
+            )
+            return healthy
+    log.warning("primary WAN (port %s) not found in wan-status response -- treating as unhealthy", port_num)
+    return False
+
+
+def build_omada_client(required: bool = True):
     missing = [
         name for name, val in [
             ("OMADA_BASE_URL", OMADA_BASE_URL),
@@ -217,10 +294,11 @@ def build_omada_client() -> OmadaClient:
         ] if not val
     ]
     if missing:
-        raise SystemExit(
-            f"Missing required Omada config: {', '.join(missing)}. "
-            f"Fill these in .env (see .env.example) before running with DRY_RUN=false."
-        )
+        msg = f"Missing required Omada config: {', '.join(missing)}. Fill these in .env (see .env.example)."
+        if required:
+            raise SystemExit(msg)
+        log.warning("%s Primary-health polling disabled until these are set.", msg)
+        return None
     return OmadaClient(
         base_url=OMADA_BASE_URL,
         client_id=OMADA_CLIENT_ID,
@@ -233,17 +311,22 @@ def build_omada_client() -> OmadaClient:
 
 def main():
     log.info(
-        "starting: targets=%s latency_thresh=%sms loss_thresh=%s%% "
-        "trigger_after=%s cycles fail_back_after=%s cycles cooldown=%ss dry_run=%s",
+        "starting: targets=%s latency_thresh=%sms loss_thresh=%s%% trigger_after=%s cycles "
+        "cooldown=%ss dry_run=%s auto_failback=%s health_poll_interval=%ss stability_window=%ss",
         PING_TARGETS, LATENCY_THRESHOLD_MS, PACKET_LOSS_THRESHOLD_PCT,
-        CONSECUTIVE_BAD_TO_TRIGGER, CONSECUTIVE_GOOD_TO_FAILBACK, COOLDOWN_SECONDS, DRY_RUN,
+        CONSECUTIVE_BAD_TO_TRIGGER, COOLDOWN_SECONDS, DRY_RUN, AUTO_FAILBACK_ENABLED,
+        PRIMARY_HEALTH_POLL_INTERVAL_SECONDS, PRIMARY_HEALTHY_STABILITY_SECONDS,
     )
 
     omada = None
     if not DRY_RUN:
-        omada = build_omada_client()
+        omada = build_omada_client(required=True)
     else:
         log.warning("DRY_RUN=true -- will log decisions but will NOT call the Omada API")
+        # Still build a client for read-only primary-health polling, so
+        # DRY_RUN testing can observe the health signal too. Not required --
+        # falls back to no polling if credentials aren't filled in yet.
+        omada = build_omada_client(required=False)
 
     db.init_db()
     log.info("metrics database ready at %s (retention %s days)", db.DB_PATH, db.RETENTION_DAYS)
@@ -251,6 +334,7 @@ def main():
     saved_state = db.get_monitor_state()
     failed_over = saved_state["failed_over"]
     last_action_time = saved_state["last_action_time"]
+    primary_healthy_since = saved_state["primary_healthy_since"]
     if failed_over:
         log.warning(
             "Resuming with failed_over=True from persisted state (last action at %s) -- "
@@ -263,6 +347,7 @@ def main():
     opposite_streak = 0
     cycle_count = 0
     last_prune_time = 0.0
+    last_health_poll_time = 0.0
 
     while True:
         cycle_count += 1
@@ -318,32 +403,69 @@ def main():
             consecutive_good = 0
             opposite_streak = 0
 
-        elif failed_over and consecutive_good >= CONSECUTIVE_GOOD_TO_FAILBACK and not cooling_down:
-            log.info(
-                "%s consecutive good cycles on original primary -- failing back",
-                consecutive_good,
-            )
-            if DRY_RUN:
-                log.warning("[DRY_RUN] would call set_active_wan(primary=%s, backup=%s)", WAN_PRIMARY_PORT_ID, WAN_BACKUP_PORT_ID)
+        elif failed_over and omada is not None and (now - last_health_poll_time) >= PRIMARY_HEALTH_POLL_INTERVAL_SECONDS:
+            last_health_poll_time = now
+            try:
+                primary_ok = check_primary_wan_health(omada)
+            except Exception as e:
+                log.warning("primary health check failed: %s", e)
+                primary_ok = False
+
+            if primary_ok:
+                if primary_healthy_since is None:
+                    primary_healthy_since = now
+                    log.info(
+                        "primary WAN reported healthy -- starting %ss stability window before fail-back is considered",
+                        PRIMARY_HEALTHY_STABILITY_SECONDS,
+                    )
+                healthy_duration = now - primary_healthy_since
+                db.set_monitor_state(failed_over=True, last_action_time=last_action_time, primary_healthy_since=primary_healthy_since)
+
+                if healthy_duration >= PRIMARY_HEALTHY_STABILITY_SECONDS and not cooling_down:
+                    if not AUTO_FAILBACK_ENABLED:
+                        log.info(
+                            "Primary WAN has been continuously healthy for %.0fs (>= %ss stability window) -- "
+                            "but AUTO_FAILBACK_ENABLED=false, so no automatic fail-back. Confirmed healthy, "
+                            "run when ready: ./test_load_balance_swap.sh failback",
+                            healthy_duration, PRIMARY_HEALTHY_STABILITY_SECONDS,
+                        )
+                        db.insert_event(
+                            ts=now, action="failback_skipped_manual_required", dry_run=True,
+                            trigger_latency_ms=None, trigger_loss_pct=None,
+                            consecutive_cycles=None,
+                        )
+                    else:
+                        log.info(
+                            "Primary WAN confirmed healthy for %.0fs -- AUTO_FAILBACK_ENABLED=true, failing back.",
+                            healthy_duration,
+                        )
+                        if DRY_RUN:
+                            log.warning("[DRY_RUN] would call set_active_wan(primary=%s, backup=%s)", WAN_PRIMARY_PORT_ID, WAN_BACKUP_PORT_ID)
+                        else:
+                            try:
+                                omada.set_active_wan(WAN_PRIMARY_PORT_ID, WAN_BACKUP_PORT_ID)
+                                log.info("fail-back command sent successfully")
+                            except OmadaAuthError as e:
+                                log.error("Omada auth failed, cannot fail back: %s", e)
+                            except Exception as e:
+                                log.error("fail-back command failed: %s", e)
+                        db.insert_event(
+                            ts=now, action="failback_to_primary", dry_run=DRY_RUN,
+                            trigger_latency_ms=None, trigger_loss_pct=None,
+                            consecutive_cycles=None,
+                        )
+                        failed_over = False
+                        last_action_time = now
+                        primary_healthy_since = None
+                        db.set_monitor_state(failed_over=False, last_action_time=last_action_time, primary_healthy_since=None)
+                        consecutive_bad = 0
+                        consecutive_good = 0
+                        opposite_streak = 0
             else:
-                try:
-                    omada.set_active_wan(WAN_PRIMARY_PORT_ID, WAN_BACKUP_PORT_ID)
-                    log.info("fail-back command sent successfully")
-                except OmadaAuthError as e:
-                    log.error("Omada auth failed, cannot fail back: %s", e)
-                except Exception as e:
-                    log.error("fail-back command failed: %s", e)
-            db.insert_event(
-                ts=now, action="failback_to_primary", dry_run=DRY_RUN,
-                trigger_latency_ms=result.avg_latency_ms, trigger_loss_pct=result.loss_pct,
-                consecutive_cycles=consecutive_good,
-            )
-            failed_over = False
-            last_action_time = now
-            db.set_monitor_state(failed_over=False, last_action_time=last_action_time)
-            consecutive_bad = 0
-            consecutive_good = 0
-            opposite_streak = 0
+                if primary_healthy_since is not None:
+                    log.info("primary WAN reported unhealthy again -- resetting stability window")
+                primary_healthy_since = None
+                db.set_monitor_state(failed_over=True, last_action_time=last_action_time, primary_healthy_since=None)
 
         if now - last_prune_time > 3600:
             db.prune_old_rows()

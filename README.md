@@ -130,11 +130,10 @@ or controller upgrade, since TP-Link has changed these paths before.
   once you've seen real false-positive behavior. Don't start below that --
   a transient 20-second blip (a single congested minute, a Wi-Fi backhaul
   hiccup upstream) shouldn't cost you a failover.
-- `CONSECUTIVE_GOOD_TO_FAILBACK` is deliberately 2x the trigger threshold.
-  Failing back too eagerly onto a link that's degrading slowly (not fully
-  down) causes flapping, which is worse for most applications (VoIP, RDP,
-  SSH sessions) than staying on the backup a little longer than strictly
-  necessary.
+- `CONSECUTIVE_GOOD_TO_FAILBACK` is no longer used for the fail-back
+  decision -- see "Fail-back: why it's based on primary WAN health" below.
+  Left in place only because `update_streaks()` computes `consecutive_good`
+  alongside `consecutive_bad` as a byproduct.
 - `COOLDOWN_SECONDS` is the real backstop against flapping -- even if the
   hysteresis counters would trigger again immediately, this blocks it.
 - The throughput check is off by default and samples rarely
@@ -155,13 +154,87 @@ A cycle is bad if **either** condition is true -- they're not both required:
 100% loss is not required. A cycle with 20% loss and normal latency counts
 as bad on its own, same as a cycle with 0% loss but 300ms latency.
 
-### From "bad cycles" to an actual failover: the streak counters
+### From "bad cycles" to an actual failover: the streak counter
 
-`CONSECUTIVE_BAD_TO_TRIGGER` (default 12) and `CONSECUTIVE_GOOD_TO_FAILBACK`
-(default 24) count consecutive bad or good cycles. Once `consecutive_bad`
-reaches the trigger threshold, `set_active_wan()` fires (subject to
-`COOLDOWN_SECONDS`, see below). Once failed over, `consecutive_good`
-reaching the fail-back threshold reverses it.
+`CONSECUTIVE_BAD_TO_TRIGGER` (default 12) counts consecutive bad cycles.
+Once it's reached, `set_active_wan()` fires to fail over to the backup
+(subject to `COOLDOWN_SECONDS`, see below). Fail-back is handled
+differently -- see the next section, since a symmetric "consecutive good
+cycles" approach turns out to be actively wrong for that direction.
+
+### Fail-back: why it's based on primary WAN health, not LAN-side pings
+
+This started as the most important gotcha in the whole design, so it's worth
+explaining the history, not just the current behavior.
+
+**The problem with the obvious approach.** The natural first design mirrors
+the trigger logic: count consecutive good ping cycles, fail back once enough
+accumulate. This is broken, though, because once failed over, the monitor's
+pings ride the *backup* WAN -- so "consecutive good cycles" after a failover
+measures "is the backup healthy," not "has the primary recovered." Those are
+different questions. Left automatic, this produces a real failure loop: fail
+over to a healthy backup -> backup stays healthy (trivially, you're riding
+it) -> good-cycle threshold hits -> auto fail-back onto the still-broken
+primary -> bad cycles resume -> fail over again -> repeat indefinitely,
+regardless of whether the primary ever actually recovers. Also relevant if
+your backup WAN has a data cap (e.g. cellular/satellite): each pointless
+round-trip burns real data for no benefit.
+
+**The actual fix: ask the primary directly.** `check_primary_wan_health()`
+in `monitor.py` queries the primary WAN's real status via the Omada API --
+data the router's own probes produce regardless of which WAN is currently
+active, sidestepping the LAN-side blind spot entirely. This is polled on
+its own cadence (`PRIMARY_HEALTH_POLL_INTERVAL_SECONDS`, default 30s)
+rather than every ping cycle, since it's a real API call.
+
+**Confirmed working (2026-07-29).** The endpoint is
+`GET /openapi/v1/{omadacId}/sites/{siteId}/gateways/{gatewayMac}/wan-status`
+-- under the **Gateway** category in Knife4j, not "Wired Network" (where
+`getWanPortsConfig` and `getInternetLoadBalance` live, which is why it took
+a while to find -- both of those are configuration, not live status, and
+neither has an online/offline field). It returns a list of per-port status
+entries with real-time `latency` (ms), `loss` (%), `internetState` (0/1),
+`status` (0/1 physical link), and `healthLevel`, matched to physical port
+numbers -- response was checked against the Omada Central UI's own Ports >
+WAN tab and matched exactly.
+
+**"Healthy" means three things, all at once, not just connectivity.**
+`check_primary_wan_health()` extracts the port number from
+`WAN_PRIMARY_PORT_ID` (e.g. `"1_8ff0..."` -> port `1`), finds that port's
+entry, and requires ALL of:
+- `internetState == 1`
+- `latency <= PRIMARY_HEALTHY_LATENCY_THRESHOLD_MS` (default 100ms)
+- `loss <= PRIMARY_HEALTHY_LOSS_THRESHOLD_PCT` (default 5%)
+
+`internetState` alone isn't enough -- a WAN can report "connected" while
+still exhibiting the same degradation (high latency, lossy) that caused the
+original failover in the first place. These thresholds are intentionally
+stricter than `LATENCY_THRESHOLD_MS`/`PACKET_LOSS_THRESHOLD_PCT` (which
+gate the LAN-ping failover *trigger*) -- the bar for "trustworthy enough to
+fail back onto" should sit above the bar for "bad enough to fail off of,"
+or you risk failing back onto a link that's merely just-below the failure
+threshold and triggering right back off it minutes later. Missing/null
+latency or loss (e.g. while the port is actually down) fails the check
+rather than passing it by default.
+
+**The 5-minute stability window.** A single healthy poll -- even one that
+clears all three conditions above -- isn't enough confidence to act on.
+`PRIMARY_HEALTHY_STABILITY_SECONDS` (default 300) requires the primary to
+pass the full health check continuously for that long before fail-back is
+even considered; any single failing poll during the window resets the
+clock to zero. This is deliberately strict (no tolerance for blips, unlike
+the ping-side debounce below) -- an intermittently-flapping primary
+shouldn't count as recovered.
+
+**`AUTO_FAILBACK_ENABLED` still defaults to false.** Even though the health
+check is now real, the flag stays conservative by default -- watch it
+correctly detect at least one real recovery in the logs before trusting it
+with real automatic action. Even once the primary clears the full stability
+window, this flag gates whether that actually triggers `set_active_wan()`
+or just logs a "confirmed healthy, run this manually" reminder:
+```
+./test_load_balance_swap.sh failback
+```
 
 ### Debounce: `STREAK_TOLERANCE_CYCLES`
 
@@ -208,12 +281,13 @@ What actually resets the streak is **2 or more consecutive** opposite-direction
 cycles at any point; that's a real, sustained change in conditions, not noise,
 and correctly starts a fresh count from that point.
 
-### Cooldown is separate from the streak counters
+### Cooldown is separate from the streak/stability logic
 
 `COOLDOWN_SECONDS` (default 120) is a hard floor between any two actions,
-independent of the streak logic above. Even if `consecutive_bad` or
-`consecutive_good` legitimately hits its threshold, no action fires until
-this many seconds have passed since the last one. This is what prevents a
+independent of both the trigger streak counter and the fail-back stability
+window above. Even if `consecutive_bad` legitimately hits its threshold, or
+the primary clears its full stability window, no action fires until this
+many seconds have passed since the last one. This is what prevents a
 genuinely flapping link from hammering the Omada API with rapid-fire
 failover/fail-back calls.
 
@@ -266,15 +340,22 @@ counter math.
    Set `LOG_LEVEL=DEBUG` too if you want to see every cycle's latency/loss,
    not just the eventual trigger/fail-back lines.
 
-4. Revert `PING_TARGETS` back to real targets and repeat step 3 to watch
-   the fail-back path. Because `monitor_state` is persisted to the sqlite
-   db (see below), the container correctly remembers `failed_over=True`
-   across this restart -- you don't need to keep it running continuously
-   to see both directions of the state machine.
+4. To test fail-back, note it no longer reacts to `PING_TARGETS` at all --
+   that path was specifically removed for being wrong (see "Fail-back: why
+   it's based on primary WAN health" above). It reacts to the real primary
+   WAN status instead, polled every `PRIMARY_HEALTH_POLL_INTERVAL_SECONDS`.
+   Shrink that and `PRIMARY_HEALTHY_STABILITY_SECONDS` temporarily (e.g. 5s
+   / 15s) the same way you'd shrink `CONSECUTIVE_BAD_TO_TRIGGER`, rebuild,
+   and watch for `primary WAN reported healthy -- starting Xs stability
+   window` followed by the eventual fail-back log once the window clears --
+   this will fire off your real primary's actual current status, so if it's
+   genuinely healthy right now, you should see this happen without needing
+   to force anything.
 
 5. Revert all test values (`PING_TARGETS`, `CONSECUTIVE_BAD_TO_TRIGGER`,
-   `CHECK_INTERVAL_SECONDS`, `LOG_LEVEL`) back to your real tuned settings
-   and recreate one final time before leaving it running for real.
+   `CHECK_INTERVAL_SECONDS`, `LOG_LEVEL`, and the health-polling values if
+   you touched them) back to your real tuned settings and recreate one
+   final time before leaving it running for real.
 
 ### Why state survives a container restart
 
