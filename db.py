@@ -24,7 +24,7 @@ _SCHEMA = """
 CREATE TABLE IF NOT EXISTS cycles (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts REAL NOT NULL,
-    avg_latency_ms REAL NOT NULL,
+    avg_latency_ms REAL,
     loss_pct REAL NOT NULL,
     is_bad INTEGER NOT NULL,
     throughput_mbps REAL
@@ -70,6 +70,43 @@ def _connect():
 def init_db():
     with _connect() as conn:
         conn.executescript(_SCHEMA)
+
+        # Migration: cycles.avg_latency_ms used to be NOT NULL, storing
+        # float('inf') for 100%-loss cycles. Infinity isn't valid JSON and
+        # silently broke the dashboard's chart. Now we store NULL instead,
+        # which requires dropping the NOT NULL constraint -- SQLite can't
+        # ALTER a column's constraint directly, so rebuild the table if the
+        # old constraint is still present.
+        cycles_info = conn.execute("PRAGMA table_info(cycles)").fetchall()
+        avg_latency_col = next((c for c in cycles_info if c[1] == "avg_latency_ms"), None)
+        if avg_latency_col is not None and avg_latency_col[3] == 1:  # notnull flag
+            conn.executescript("""
+                ALTER TABLE cycles RENAME TO cycles_old;
+                CREATE TABLE cycles (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts REAL NOT NULL,
+                    avg_latency_ms REAL,
+                    loss_pct REAL NOT NULL,
+                    is_bad INTEGER NOT NULL,
+                    throughput_mbps REAL
+                );
+                INSERT INTO cycles (id, ts, avg_latency_ms, loss_pct, is_bad, throughput_mbps)
+                    SELECT id, ts, avg_latency_ms, loss_pct, is_bad, throughput_mbps FROM cycles_old;
+                DROP TABLE cycles_old;
+                CREATE INDEX IF NOT EXISTS idx_cycles_ts ON cycles(ts);
+            """)
+
+        # Data migration: rows inserted before the insert_cycle() fix above
+        # may already have literal Infinity stored (SQLite's REAL type can
+        # hold IEEE754 infinity just fine -- it round-trips through Python's
+        # sqlite3 driver as float('inf')). The schema fix above only stops
+        # NEW rows from getting it; existing rows need cleaning up too, or
+        # they keep breaking the dashboard's JSON responses indefinitely.
+        rows = conn.execute("SELECT id, avg_latency_ms FROM cycles WHERE avg_latency_ms IS NOT NULL").fetchall()
+        inf_ids = [row[0] for row in rows if row[1] == float("inf")]
+        if inf_ids:
+            conn.executemany("UPDATE cycles SET avg_latency_ms = NULL WHERE id = ?", [(i,) for i in inf_ids])
+
         # Migration: monitor_state existed before primary_healthy_since was
         # added. CREATE TABLE IF NOT EXISTS won't add columns to an already-
         # existing table, so add it explicitly if missing.
@@ -79,6 +116,14 @@ def init_db():
 
 
 def insert_cycle(ts: float, avg_latency_ms: float, loss_pct: float, is_bad: bool, throughput_mbps=None):
+    # avg_latency_ms can be float('inf') when a cycle has 100% loss (no
+    # successful pings to average). Infinity is not valid JSON -- storing
+    # it here would silently break the dashboard's /api/cycles endpoint
+    # (Python's json module happily emits the literal token `Infinity`,
+    # which browsers' JSON.parse rejects). Store NULL instead, meaning
+    # "no latency data for this cycle" rather than an unusable sentinel.
+    if avg_latency_ms == float("inf"):
+        avg_latency_ms = None
     with _connect() as conn:
         conn.execute(
             "INSERT INTO cycles (ts, avg_latency_ms, loss_pct, is_bad, throughput_mbps) VALUES (?, ?, ?, ?, ?)",
@@ -184,7 +229,7 @@ def compute_degradation_windows(since_ts: float, max_gap_seconds: float = 15.0):
 
     result = []
     for w in windows:
-        latencies = [s["avg_latency_ms"] for s in w["samples"] if s["avg_latency_ms"] != float("inf")]
+        latencies = [s["avg_latency_ms"] for s in w["samples"] if s["avg_latency_ms"] is not None]
         losses = [s["loss_pct"] for s in w["samples"]]
         result.append({
             "start": w["start"],
