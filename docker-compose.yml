@@ -1,0 +1,42 @@
+services:
+  wan-failover-monitor:
+    build: .
+    container_name: wan-failover-monitor
+    restart: unless-stopped
+    # CAP_NET_RAW is required for the `ping` binary to open raw ICMP sockets
+    # as a non-root user inside the container. Everything else stays
+    # unprivileged.
+    cap_add:
+      - NET_RAW
+    env_file:
+      - .env
+    volumes:
+      - wan-monitor-data:/data
+    # If you want to eventually run the "poll the router's own SLA/echo
+    # results" path (the more correct approach described in the README),
+    # this container needs network line-of-sight to the Omada Controller's
+    # management port (usually 8043/8443). Default bridge networking is
+    # fine for that since it's just an HTTPS call out to the LAN.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  wan-failover-dashboard:
+    build: .
+    container_name: wan-failover-dashboard
+    restart: unless-stopped
+    command: ["python", "dashboard.py"]
+    env_file:
+      - .env
+    volumes:
+      - wan-monitor-data:/data
+    ports:
+      # Reachable at http://<this-host>:8090
+      - "8090:8090"
+    depends_on:
+      - wan-failover-monitor
+
+volumes:
+  wan-monitor-data:
