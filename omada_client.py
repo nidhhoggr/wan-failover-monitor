@@ -313,6 +313,39 @@ class OmadaClient:
         params = {"start": start_ts, "end": end_ts}
         return self._get(path, params=params)
 
+    def start_speed_test(self, gateway_mac: str, port_uuids: list) -> Any:
+        """
+        PENDING LIVE CONFIRMATION: POST /openapi/v1/{omadacId}/sites/{siteId}/gateways/{gatewayMac}/speedTest
+
+        port_uuids: list of WAN port identifier strings -- the SAME format
+        as WAN_PRIMARY_PORT_ID/WAN_BACKUP_PORT_ID (e.g.
+        "1_8ff0def98a03428b93d15678efa14052"), confirmed from
+        get_wan_ports_config()'s response. NOT MAC addresses, despite the
+        gateway itself being identified by MAC as a separate path param --
+        easy to conflate the two, worth being careful about.
+
+        This starts an ASYNC test -- the response just confirms which
+        device is running it (deviceMac). Poll get_speed_test_result()
+        afterward until the relevant port's progress reaches 100.
+        """
+        path = f"/openapi/v1/{self.omadac_id}/sites/{self.site_id}/gateways/{gateway_mac}/speedTest"
+        body = {"portUuidList": port_uuids}
+        return self._post(path, body)
+
+    def get_speed_test_result(self, gateway_mac: str) -> dict:
+        """
+        PENDING LIVE CONFIRMATION: GET /openapi/v1/{omadacId}/sites/{siteId}/gateways/{gatewayMac}/speedTestResult
+
+        Poll this after start_speed_test(). Returns {status, portSpeedResults:
+        [{portId (bare int, NOT the "1_hash" uuid string -- matches by the
+        leading integer), time, portName, isp, serverName, serverLocation,
+        status, latency, down, up, progress}, ...]}. down/up units not
+        stated in the docs -- unconfirmed until checked against a real
+        response, don't trust a unit label on this without verifying.
+        """
+        path = f"/openapi/v1/{self.omadac_id}/sites/{self.site_id}/gateways/{gateway_mac}/speedTestResult"
+        return self._get(path)
+
     @classmethod
     def from_env(cls):
         """

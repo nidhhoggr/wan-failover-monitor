@@ -115,6 +115,26 @@ PAGE = """
     .tab-btn:first-child { border-radius: 4px 0 0 4px; }
     .tab-btn:last-child { border-radius: 0 4px 4px 0; border-left: none; }
     .tab-btn.active { background: #2b2f38; color: #e6e6e6; font-weight: bold; }
+    .speedtest-controls { display: flex; align-items: center; gap: 0.75rem; margin-bottom: 0.75rem; }
+    .speedtest-controls select { background: #1a1d24; color: #e6e6e6; border: 1px solid #333;
+                                  border-radius: 4px; padding: 0.4rem 0.6rem; font-size: 0.85rem; }
+    #speedtest-start-btn { background: #2b6cb0; color: white; border: none; border-radius: 4px;
+                            padding: 0.5rem 1rem; font-size: 0.85rem; cursor: pointer; }
+    #speedtest-start-btn:disabled { background: #444; cursor: default; opacity: 0.7; }
+    #speedtest-result { background: #14161c; border: 1px solid #2a2d35; border-radius: 6px;
+                         padding: 0.9rem; font-size: 0.85rem; min-height: 1.5rem; }
+    .speedtest-metric { display: inline-block; margin-right: 2rem; }
+    .speedtest-metric b { font-size: 1.2rem; display: block; }
+    .speedtest-progress-bar { background: #2a2d35; border-radius: 4px; height: 6px; margin-top: 0.6rem; overflow: hidden; }
+    .speedtest-progress-fill { background: #4a90e2; height: 100%; transition: width 0.3s; }
+    .active-wan-panel { display: flex; align-items: center; gap: 1rem; background: #14161c;
+                         border: 1px solid #2a2d35; border-radius: 6px; padding: 0.7rem 1rem; margin-bottom: 1rem; }
+    .active-wan-panel .wan-badge { background: #1c3a24; color: #3ecf6e; border-radius: 4px;
+                                    padding: 0.2rem 0.6rem; font-weight: bold; font-size: 0.85rem; }
+    #failover-btn { background: #a33; color: white; border: none; border-radius: 4px;
+                     padding: 0.5rem 1rem; font-size: 0.85rem; cursor: pointer; margin-left: auto; }
+    #failover-btn:hover:not(:disabled) { background: #c44; }
+    #failover-btn:disabled { background: #444; cursor: default; opacity: 0.7; }
   </style>
 </head>
 <body>
@@ -132,6 +152,12 @@ PAGE = """
     <span id="last-updated"></span>
   </div>
 
+  <div class="active-wan-panel">
+    <span>Active WAN: <span id="active-wan-name" class="wan-badge">--</span></span>
+    <span id="backup-wan-info" style="color:#888; font-size:0.85rem;"></span>
+    <button id="failover-btn" onclick="triggerFailover()" disabled>Switch WAN</button>
+  </div>
+
   <div>
     <div class="stat"><b id="stat-windows">--</b>degradation windows</div>
     <div class="stat"><b id="stat-minutes">--</b>total degraded time</div>
@@ -145,12 +171,20 @@ PAGE = """
     <div id="alerts-list">Loading...</div>
   </div>
 
+  <h2 id="ping-chart-title" style="font-size:1rem; margin: 1.5rem 0 0.5rem;">Latency &amp; Loss</h2>
   <canvas id="chart" height="90"></canvas>
 
   <h2 style="font-size:1rem; margin: 1.5rem 0 0.5rem;">WAN Metrics (router-reported)</h2>
   <div class="wan-metrics-tabs" id="wan-metrics-tabs"></div>
   <div id="wan-metrics-error" class="alerts-error" style="display:none;"></div>
   <div id="wan-metrics-charts"></div>
+
+  <h2 style="font-size:1rem; margin: 1.5rem 0 0.5rem;">Speed Test</h2>
+  <div class="speedtest-controls">
+    <select id="speedtest-wan-select"><option>Loading WANs...</option></select>
+    <button id="speedtest-start-btn" onclick="startSpeedTest()">Start Speed Test</button>
+  </div>
+  <div id="speedtest-result"></div>
 
   <a class="export" href="/report.csv?range={{ selected_range }}">Download ISP report (CSV)</a>
 
@@ -193,6 +227,70 @@ PAGE = """
       const p = {};
       parts.forEach(part => { p[part.type] = part.value; });
       return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}:${p.second}`;
+    }
+
+    let currentActiveWan = null;
+    let currentBackupWan = null;
+    let failoverInFlight = false;
+
+    function renderActiveWan(resp) {
+      const nameEl = document.getElementById('active-wan-name');
+      const backupInfoEl = document.getElementById('backup-wan-info');
+      const btn = document.getElementById('failover-btn');
+      const chartTitle = document.getElementById('ping-chart-title');
+
+      if (resp.error || !resp.active) {
+        nameEl.textContent = 'unavailable';
+        backupInfoEl.textContent = resp.error ? escapeHtml(resp.error) : '';
+        btn.disabled = true;
+        if (chartTitle) chartTitle.textContent = 'Latency & Loss';
+        return;
+      }
+
+      currentActiveWan = resp.active;
+      currentBackupWan = resp.backup;
+      nameEl.textContent = resp.active.portName;
+      backupInfoEl.textContent = resp.backup ? `(backup: ${resp.backup.portName})` : '';
+      if (!failoverInFlight) {
+        btn.disabled = !resp.backup;
+        btn.textContent = resp.backup ? `Switch to ${resp.backup.portName}` : 'Switch WAN';
+      }
+      if (chartTitle) chartTitle.textContent = `Latency & Loss (reporting on: ${resp.active.portName})`;
+    }
+
+    function triggerFailover() {
+      if (!currentActiveWan || !currentBackupWan || failoverInFlight) return;
+
+      const confirmed = window.confirm(
+        `This will immediately move traffic from "${currentActiveWan.portName}" to "${currentBackupWan.portName}".\n\n` +
+        `This is a LIVE change to your network -- the same underlying action as running ` +
+        `./test_load_balance_swap.sh failover on the command line.\n\nAre you sure?`
+      );
+      if (!confirmed) return;
+
+      failoverInFlight = true;
+      const btn = document.getElementById('failover-btn');
+      btn.disabled = true;
+      btn.textContent = 'Switching...';
+
+      fetch('/api/failover', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ confirm: true }),
+      }).then(r => r.json()).then(data => {
+        failoverInFlight = false;
+        if (data.success) {
+          loadData();  // refresh everything -- badge, chart title, etc. should reflect the new state
+        } else {
+          alert('Failover failed: ' + data.error);
+          btn.disabled = false;
+          btn.textContent = currentBackupWan ? `Switch to ${currentBackupWan.portName}` : 'Switch WAN';
+        }
+      }).catch(err => {
+        failoverInFlight = false;
+        alert('Failover failed: ' + err);
+        btn.disabled = false;
+      });
     }
 
     function updateChart(cycles) {
@@ -376,6 +474,148 @@ PAGE = """
       return div.innerHTML;
     }
 
+    let speedTestPollTimer = null;
+    const SPEEDTEST_POLL_INTERVAL_MS = 2000;
+    const SPEEDTEST_TIMEOUT_MS = 90000;
+
+    function loadWanPortsForSpeedTest() {
+      fetch('/api/device-capabilities').then(r => r.json()).then(cap => {
+        if (cap.speedTestSupported === false) {
+          document.getElementById('speedtest-wan-select').outerHTML =
+            '<span style="color:#888;">Not available on this device</span>';
+          document.getElementById('speedtest-start-btn').style.display = 'none';
+          document.getElementById('speedtest-result').innerHTML =
+            'This gateway reports it does not support speed tests via the API (confirmed by a real rejection: "This device does not support speed test.").';
+          return;  // don't bother populating the port list, the feature can't work here regardless
+        }
+        // speedTestSupported === true, or null/unknown (e.g. credentials
+        // missing) -- in the unknown case, still offer the button; a real
+        // click will surface whatever the actual problem is via the normal
+        // error path, same as it did when this genuinely wasn't supported.
+        loadWanPortOptions();
+      }).catch(err => {
+        console.error('Failed to check device capabilities:', err);
+        loadWanPortOptions();  // fail open -- let a real attempt surface the actual error
+      });
+    }
+
+    function loadWanPortOptions() {
+      fetch('/api/wan-ports').then(r => r.json()).then(resp => {
+        const select = document.getElementById('speedtest-wan-select');
+        if (resp.error) {
+          select.innerHTML = `<option>Unavailable: ${escapeHtml(resp.error)}</option>`;
+          document.getElementById('speedtest-start-btn').disabled = true;
+          return;
+        }
+        if (resp.ports.length === 0) {
+          select.innerHTML = '<option>No WAN ports found</option>';
+          return;
+        }
+        select.innerHTML = resp.ports.map(p =>
+          `<option value="${escapeHtml(p.portId)}">${escapeHtml(p.portName)}</option>`
+        ).join('');
+      }).catch(err => {
+        console.error('Failed to load WAN ports for speed test:', err);
+        document.getElementById('speedtest-wan-select').innerHTML = '<option>Failed to load</option>';
+      });
+    }
+
+    function startSpeedTest() {
+      const select = document.getElementById('speedtest-wan-select');
+      const btn = document.getElementById('speedtest-start-btn');
+      const resultDiv = document.getElementById('speedtest-result');
+      const portUuid = select.value;
+      if (!portUuid) return;
+
+      select.disabled = true;
+      btn.disabled = true;
+      btn.textContent = 'Starting...';
+      resultDiv.innerHTML = 'Starting speed test...';
+
+      fetch('/api/speedtest/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ portUuid: portUuid }),
+      }).then(r => r.json()).then(data => {
+        if (!data.success) {
+          resultDiv.innerHTML = `<span style="color:#f28b82">Failed to start: ${escapeHtml(data.error)}</span>`;
+          select.disabled = false;
+          btn.disabled = false;
+          btn.textContent = 'Start Speed Test';
+          return;
+        }
+        btn.textContent = 'Running...';
+        // Port results are matched by the leading integer of the "1_hash"
+        // portId string (e.g. "1_8ff0..." -> port 1) -- same convention
+        // already used in monitor.py's check_primary_wan_health().
+        const portNum = parseInt(portUuid.split('_')[0], 10);
+        pollSpeedTestResult(portNum, Date.now());
+      }).catch(err => {
+        resultDiv.innerHTML = `<span style="color:#f28b82">Failed to start: ${escapeHtml(String(err))}</span>`;
+        select.disabled = false;
+        btn.disabled = false;
+        btn.textContent = 'Start Speed Test';
+      });
+    }
+
+    function pollSpeedTestResult(portNum, startedAt) {
+      if (speedTestPollTimer !== null) { clearTimeout(speedTestPollTimer); speedTestPollTimer = null; }
+
+      const select = document.getElementById('speedtest-wan-select');
+      const btn = document.getElementById('speedtest-start-btn');
+      const resultDiv = document.getElementById('speedtest-result');
+
+      if (Date.now() - startedAt > SPEEDTEST_TIMEOUT_MS) {
+        resultDiv.innerHTML = '<span style="color:#f28b82">Speed test timed out waiting for a result.</span>';
+        select.disabled = false;
+        btn.disabled = false;
+        btn.textContent = 'Start Speed Test';
+        return;
+      }
+
+      fetch('/api/speedtest/result').then(r => r.json()).then(data => {
+        if (data.error) {
+          resultDiv.innerHTML = `<span style="color:#f28b82">Error checking result: ${escapeHtml(data.error)}</span>`;
+          select.disabled = false;
+          btn.disabled = false;
+          btn.textContent = 'Start Speed Test';
+          return;
+        }
+
+        const results = (data.result && data.result.portSpeedResults) || [];
+        const portResult = results.find(r => r.portId === portNum);
+
+        if (!portResult) {
+          // No result for this port yet -- keep waiting.
+          resultDiv.innerHTML = 'Waiting for result...';
+          speedTestPollTimer = setTimeout(() => pollSpeedTestResult(portNum, startedAt), SPEEDTEST_POLL_INTERVAL_MS);
+          return;
+        }
+
+        const progress = portResult.progress || 0;
+        resultDiv.innerHTML = `
+          <div class="speedtest-metric"><b>${portResult.down ?? '--'}</b>Download (unit unconfirmed)</div>
+          <div class="speedtest-metric"><b>${portResult.up ?? '--'}</b>Upload (unit unconfirmed)</div>
+          <div class="speedtest-metric"><b>${portResult.latency ?? '--'} ms</b>Latency</div>
+          <div>${escapeHtml(portResult.serverName || '')} ${escapeHtml(portResult.serverLocation || '')}</div>
+          <div class="speedtest-progress-bar"><div class="speedtest-progress-fill" style="width:${Math.min(progress, 100)}%"></div></div>
+        `;
+
+        if (progress >= 100) {
+          select.disabled = false;
+          btn.disabled = false;
+          btn.textContent = 'Start Speed Test';
+        } else {
+          speedTestPollTimer = setTimeout(() => pollSpeedTestResult(portNum, startedAt), SPEEDTEST_POLL_INTERVAL_MS);
+        }
+      }).catch(err => {
+        resultDiv.innerHTML = `<span style="color:#f28b82">Error checking result: ${escapeHtml(String(err))}</span>`;
+        select.disabled = false;
+        btn.disabled = false;
+        btn.textContent = 'Start Speed Test';
+      });
+    }
+
     function resolveAlert(id, btn) {
       btn.disabled = true;
       btn.textContent = 'Resolving...';
@@ -436,12 +676,14 @@ PAGE = """
         fetch(`/api/events?range=${CURRENT_RANGE}`).then(r => r.json()),
         fetch(`/api/alerts`).then(r => r.json()),
         fetch(`/api/isp-load?range=${CURRENT_RANGE}`).then(r => r.json()),
-      ]).then(([cycles, windows, events, alerts, ispLoad]) => {
+        fetch(`/api/active-wan`).then(r => r.json()),
+      ]).then(([cycles, windows, events, alerts, ispLoad, activeWan]) => {
         updateChart(cycles);
         renderTable(windows);
         renderStats(windows, events);
         renderAlerts(alerts);
         updateWanMetricsChart(ispLoad);
+        renderActiveWan(activeWan);
         document.getElementById('last-updated').textContent =
           'Updated ' + new Date().toLocaleTimeString();
       }).catch(err => {
@@ -476,6 +718,7 @@ PAGE = """
 
     loadData();
     startPolling();
+    loadWanPortsForSpeedTest();
   </script>
 </body>
 </html>
@@ -596,6 +839,158 @@ def api_isp_load():
     except Exception as e:
         log.warning("Failed to fetch ISP load: %s", e)
         return jsonify({"ports": [], "error": str(e)})
+
+
+@app.route("/api/wan-ports")
+def api_wan_ports():
+    """Populates the speed-test WAN dropdown. Reuses the already-confirmed
+    get_wan_ports_config() -- static-ish data, not part of the live-poll
+    cycle, fetched once on page load."""
+    client = get_omada_client()
+    if client is None:
+        return jsonify({"ports": [], "error": _omada_client_error})
+    try:
+        result = client.get_wan_ports_config()
+        ports = [
+            {"portId": p["portId"], "portName": p["portName"]}
+            for p in result.get("wanPortsConfig", [])
+        ]
+        return jsonify({"ports": ports, "error": None})
+    except Exception as e:
+        log.warning("Failed to fetch WAN ports list: %s", e)
+        return jsonify({"ports": [], "error": str(e)})
+
+
+@app.route("/api/device-capabilities")
+def api_device_capabilities():
+    """
+    Checks whether this gateway actually supports speed tests before the UI
+    offers the button -- confirmed via a real rejection that osgCap.speedTest
+    reports this accurately (an ER605 with speedTest:false correctly failed
+    with "This device does not support speed test." on a real start attempt).
+    """
+    client = get_omada_client()
+    if client is None:
+        return jsonify({"speedTestSupported": None, "error": _omada_client_error})
+
+    gateway_mac = os.environ.get("OMADA_GATEWAY_MAC", "")
+    if not gateway_mac:
+        return jsonify({"speedTestSupported": None, "error": "OMADA_GATEWAY_MAC not configured"})
+
+    try:
+        gateway = client.get_gateway(gateway_mac)
+        supported = gateway.get("osgCap", {}).get("speedTest")
+        return jsonify({"speedTestSupported": bool(supported), "error": None})
+    except Exception as e:
+        log.warning("Failed to check device capabilities: %s", e)
+        return jsonify({"speedTestSupported": None, "error": str(e)})
+
+
+@app.route("/api/speedtest/start", methods=["POST"])
+def api_speedtest_start():
+    client = get_omada_client()
+    if client is None:
+        return jsonify({"success": False, "error": _omada_client_error})
+
+    gateway_mac = os.environ.get("OMADA_GATEWAY_MAC", "")
+    if not gateway_mac:
+        return jsonify({"success": False, "error": "OMADA_GATEWAY_MAC not configured"})
+
+    body = request.get_json(silent=True) or {}
+    port_uuid = body.get("portUuid")
+    if not port_uuid:
+        return jsonify({"success": False, "error": "Missing 'portUuid' in request body"}), 400
+
+    try:
+        client.start_speed_test(gateway_mac, [port_uuid])
+        return jsonify({"success": True, "error": None})
+    except Exception as e:
+        log.warning("Failed to start speed test on %s: %s", port_uuid, e)
+        return jsonify({"success": False, "error": str(e)})
+
+
+@app.route("/api/speedtest/result")
+def api_speedtest_result():
+    client = get_omada_client()
+    if client is None:
+        return jsonify({"result": None, "error": _omada_client_error})
+
+    gateway_mac = os.environ.get("OMADA_GATEWAY_MAC", "")
+    if not gateway_mac:
+        return jsonify({"result": None, "error": "OMADA_GATEWAY_MAC not configured"})
+
+    try:
+        result = client.get_speed_test_result(gateway_mac)
+        return jsonify({"result": result, "error": None})
+    except Exception as e:
+        log.warning("Failed to fetch speed test result: %s", e)
+        return jsonify({"result": None, "error": str(e)})
+
+
+@app.route("/api/active-wan")
+def api_active_wan():
+    """
+    Current primary/backup WAN, with human-readable names joined in from
+    get_wan_ports_config() (load-balance config only has portId strings,
+    not names). Two real API calls per invocation -- acceptable at the
+    normal 15s live-poll cadence, same pattern as /api/alerts and
+    /api/isp-load already adding their own per-cycle calls.
+    """
+    client = get_omada_client()
+    if client is None:
+        return jsonify({"active": None, "backup": None, "linkBackup": None, "error": _omada_client_error})
+    try:
+        lb = client.get_internet_load_balance()
+        wan_config = client.get_wan_ports_config()
+        name_by_id = {p["portId"]: p["portName"] for p in wan_config.get("wanPortsConfig", [])}
+        primary_id = (lb.get("primaryWans") or [None])[0]
+        backup_id = lb.get("backupWan")
+        return jsonify({
+            "active": {"portId": primary_id, "portName": name_by_id.get(primary_id, primary_id)} if primary_id else None,
+            "backup": {"portId": backup_id, "portName": name_by_id.get(backup_id, backup_id)} if backup_id else None,
+            "linkBackup": lb.get("linkBackup"),
+            "error": None,
+        })
+    except Exception as e:
+        log.warning("Failed to fetch active WAN status: %s", e)
+        return jsonify({"active": None, "backup": None, "linkBackup": None, "error": str(e)})
+
+
+@app.route("/api/failover", methods=["POST"])
+def api_failover():
+    """
+    Manually triggers a failover from the dashboard -- functionally
+    identical to `./test_load_balance_swap.sh failover`/`failback`: fetches
+    the CURRENT live config fresh (not trusting whatever the frontend last
+    saw, to avoid acting on stale state) and swaps primaryWans/backupWan via
+    the same set_active_wan() used everywhere else in this project.
+
+    This is a LIVE write moving real traffic -- requires an explicit
+    {"confirm": true} in the request body. The frontend is expected to have
+    already gotten an explicit user confirmation (a real confirm dialog)
+    before ever sending that -- this check exists so the endpoint itself
+    can't be triggered by an accidental/automated POST without intent.
+    """
+    client = get_omada_client()
+    if client is None:
+        return jsonify({"success": False, "error": _omada_client_error})
+
+    body = request.get_json(silent=True) or {}
+    if not body.get("confirm"):
+        return jsonify({"success": False, "error": "Missing confirmation"}), 400
+
+    try:
+        current = client.get_internet_load_balance()
+        current_primary = (current.get("primaryWans") or [None])[0]
+        current_backup = current.get("backupWan")
+        if not current_primary or not current_backup:
+            return jsonify({"success": False, "error": "Could not determine current primary/backup WAN from live config"})
+
+        client.set_active_wan(current_backup, current_primary)  # swap: new primary = old backup
+        return jsonify({"success": True, "error": None, "newPrimary": current_backup, "newBackup": current_primary})
+    except Exception as e:
+        log.warning("Failed to trigger failover: %s", e)
+        return jsonify({"success": False, "error": str(e)})
 
 
 @app.route("/report.csv")
