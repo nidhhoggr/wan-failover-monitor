@@ -70,72 +70,148 @@ PAGE = """
 <!doctype html>
 <html>
 <head>
+  <script>
+    // Set the theme attribute before the stylesheet paints anything, to
+    // avoid a flash of the wrong theme on load. Defaults to the OS-level
+    // preference if nothing's been chosen here before; otherwise honors
+    // whatever was last picked, persisted across visits.
+    (function () {
+      var saved = localStorage.getItem('wan-monitor-theme');
+      var theme = saved || (window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+      document.documentElement.setAttribute('data-theme', theme);
+    })();
+  </script>
   <meta charset="utf-8">
   <title>WAN Failover Monitor</title>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
   <style>
-    body { font-family: -apple-system, Helvetica, Arial, sans-serif; margin: 2rem; background: #0f1115; color: #e6e6e6; }
+    :root {
+      --bg-page: #0f1115;
+      --bg-card: #14161c;
+      --bg-card-alt: #1a1d24;
+      --bg-card-active: #2b2f38;
+      --border-color: #2a2d35;
+      --border-color-strong: #333;
+      --text-primary: #e6e6e6;
+      --text-secondary: #999;
+      --text-muted: #888;
+      --accent-link: #8ab4f8;
+      --accent-blue: #4a90e2;
+      --accent-blue-strong: #2b6cb0;
+      --accent-green: #3ecf6e;
+      --accent-green-bg: #1c3a24;
+      --accent-red: #d64545;
+      --accent-red-soft: #f28b82;
+      --accent-red-strong: #a33;
+      --accent-red-strong-hover: #c44;
+      --accent-red-badge-bg: #5c1e1e;
+      --accent-red-badge-text: #ffb3b3;
+      --accent-orange-bg: #3a2a12;
+      --accent-orange-text: #f0b155;
+      --btn-disabled-bg: #444;
+      --chart-grid: #222;
+      --chart-tick: #999;
+      --chart-legend: #ccc;
+    }
+    [data-theme="light"] {
+      --bg-page: #f5f6f8;
+      --bg-card: #ffffff;
+      --bg-card-alt: #eef0f3;
+      --bg-card-active: #dde3ea;
+      --border-color: #d8dce2;
+      --border-color-strong: #c5cad2;
+      --text-primary: #1a1d24;
+      --text-secondary: #5b6270;
+      --text-muted: #757c8a;
+      --accent-link: #2b6cb0;
+      --accent-blue: #2b6cb0;
+      --accent-blue-strong: #2b6cb0;
+      --accent-green: #1f9950;
+      --accent-green-bg: #dff3e6;
+      --accent-red: #c53030;
+      --accent-red-soft: #c53030;
+      --accent-red-strong: #c53030;
+      --accent-red-strong-hover: #a82424;
+      --accent-red-badge-bg: #fbdada;
+      --accent-red-badge-text: #a82424;
+      --accent-orange-bg: #fdf0da;
+      --accent-orange-text: #9a6a12;
+      --btn-disabled-bg: #ccc;
+      --chart-grid: #e3e6ea;
+      --chart-tick: #5b6270;
+      --chart-legend: #333;
+    }
+    body { font-family: -apple-system, Helvetica, Arial, sans-serif; margin: 2rem;
+           background: var(--bg-page); color: var(--text-primary); }
     h1 { font-size: 1.3rem; display: inline-block; margin-right: 1rem; }
     .controls { margin-bottom: 1rem; display: flex; align-items: center; flex-wrap: wrap; gap: 1rem; }
-    .controls a { color: #8ab4f8; margin-right: 1rem; text-decoration: none; }
+    .controls a { color: var(--accent-link); margin-right: 1rem; text-decoration: none; }
     .controls a.active { font-weight: bold; text-decoration: underline; }
     table { border-collapse: collapse; width: 100%; margin-top: 1.5rem; font-size: 0.85rem; }
-    th, td { border: 1px solid #333; padding: 0.4rem 0.6rem; text-align: right; }
-    th { background: #1a1d24; }
+    th, td { border: 1px solid var(--border-color-strong); padding: 0.4rem 0.6rem; text-align: right; }
+    th { background: var(--bg-card-alt); }
     td:first-child, th:first-child { text-align: left; }
-    canvas { background: #14161c; border-radius: 6px; padding: 1rem; }
-    .export { margin-top: 1rem; display: inline-block; background: #2b6cb0; color: white; padding: 0.5rem 1rem;
-              border-radius: 4px; text-decoration: none; font-size: 0.85rem; }
+    canvas { background: var(--bg-card); border-radius: 6px; padding: 1rem; }
+    .export { margin-top: 1rem; display: inline-block; background: var(--accent-blue-strong); color: white;
+              padding: 0.5rem 1rem; border-radius: 4px; text-decoration: none; font-size: 0.85rem; }
     .stat { display: inline-block; margin-right: 2rem; }
     .stat b { font-size: 1.4rem; display: block; }
-    #live-toggle-btn { background: #1a1d24; color: #e6e6e6; border: 1px solid #333; border-radius: 4px;
-                        padding: 0.4rem 0.8rem; cursor: pointer; font-size: 0.85rem; }
-    #live-toggle-btn.live { border-color: #3ecf6e; color: #3ecf6e; }
-    #live-toggle-btn.paused { border-color: #999; color: #999; }
+    #theme-toggle-btn { background: var(--bg-card-alt); color: var(--text-primary); border: 1px solid var(--border-color-strong);
+                         border-radius: 4px; padding: 0.4rem 0.8rem; cursor: pointer; font-size: 0.85rem; }
+    #live-toggle-btn { background: var(--bg-card-alt); color: var(--text-primary); border: 1px solid var(--border-color-strong);
+                        border-radius: 4px; padding: 0.4rem 0.8rem; cursor: pointer; font-size: 0.85rem; }
+    #live-toggle-btn.live { border-color: var(--accent-green); color: var(--accent-green); }
+    #live-toggle-btn.paused { border-color: var(--text-secondary); color: var(--text-secondary); }
     #live-indicator { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 0.4rem; }
-    #live-indicator.live { background: #3ecf6e; }
-    #live-indicator.paused { background: #999; }
-    #last-updated { color: #888; font-size: 0.8rem; }
-    .count-badge { background: #5c1e1e; color: #ffb3b3; border-radius: 10px; padding: 0.05rem 0.5rem;
-                   font-size: 0.75rem; vertical-align: middle; }
-    .alert-item { display: flex; align-items: center; gap: 0.75rem; background: #14161c;
-                  border: 1px solid #2a2d35; border-radius: 6px; padding: 0.6rem 0.9rem; margin-bottom: 0.5rem; }
+    #live-indicator.live { background: var(--accent-green); }
+    #live-indicator.paused { background: var(--text-secondary); }
+    #last-updated { color: var(--text-muted); font-size: 0.8rem; }
+    .count-badge { background: var(--accent-red-badge-bg); color: var(--accent-red-badge-text); border-radius: 10px;
+                   padding: 0.05rem 0.5rem; font-size: 0.75rem; vertical-align: middle; }
+    .alert-item { display: flex; align-items: center; gap: 0.75rem; background: var(--bg-card);
+                  border: 1px solid var(--border-color); border-radius: 6px; padding: 0.6rem 0.9rem; margin-bottom: 0.5rem; }
     .alert-level { font-size: 0.7rem; text-transform: uppercase; padding: 0.15rem 0.5rem; border-radius: 3px;
-                    background: #3a2a12; color: #f0b155; white-space: nowrap; }
+                    background: var(--accent-orange-bg); color: var(--accent-orange-text); white-space: nowrap; }
     .alert-content { flex: 1; font-size: 0.85rem; }
-    .alert-time { color: #888; font-size: 0.78rem; white-space: nowrap; }
-    .alert-ack-btn { background: transparent; border: 1px solid #444; color: #999; border-radius: 4px;
-                      padding: 0.25rem 0.6rem; font-size: 0.75rem; cursor: pointer; white-space: nowrap; }
-    .alert-ack-btn:hover:not(:disabled) { border-color: #3ecf6e; color: #3ecf6e; }
+    .alert-time { color: var(--text-muted); font-size: 0.78rem; white-space: nowrap; }
+    .alert-ack-btn { background: transparent; border: 1px solid var(--border-color-strong); color: var(--text-secondary);
+                      border-radius: 4px; padding: 0.25rem 0.6rem; font-size: 0.75rem; cursor: pointer; white-space: nowrap; }
+    .alert-ack-btn:hover:not(:disabled) { border-color: var(--accent-green); color: var(--accent-green); }
     .alert-ack-btn:disabled { cursor: default; opacity: 0.6; }
-    .alerts-empty { color: #888; font-size: 0.85rem; padding: 0.5rem 0; }
-    .alerts-error { color: #f28b82; font-size: 0.85rem; padding: 0.5rem 0; }
+    .alerts-empty { color: var(--text-muted); font-size: 0.85rem; padding: 0.5rem 0; }
+    .alerts-error { color: var(--accent-red-soft); font-size: 0.85rem; padding: 0.5rem 0; }
     .wan-metrics-tabs { margin-bottom: 0.75rem; }
-    .tab-btn { background: #1a1d24; color: #999; border: 1px solid #333; padding: 0.4rem 0.9rem;
-               font-size: 0.85rem; cursor: pointer; }
+    .tab-btn { background: var(--bg-card-alt); color: var(--text-secondary); border: 1px solid var(--border-color-strong);
+               padding: 0.4rem 0.9rem; font-size: 0.85rem; cursor: pointer; }
     .tab-btn:first-child { border-radius: 4px 0 0 4px; }
     .tab-btn:last-child { border-radius: 0 4px 4px 0; border-left: none; }
-    .tab-btn.active { background: #2b2f38; color: #e6e6e6; font-weight: bold; }
+    .tab-btn.active { background: var(--bg-card-active); color: var(--text-primary); font-weight: bold; }
     .speedtest-controls { display: flex; align-items: center; gap: 0.75rem; margin-bottom: 0.75rem; }
-    .speedtest-controls select { background: #1a1d24; color: #e6e6e6; border: 1px solid #333;
+    .speedtest-controls select { background: var(--bg-card-alt); color: var(--text-primary); border: 1px solid var(--border-color-strong);
                                   border-radius: 4px; padding: 0.4rem 0.6rem; font-size: 0.85rem; }
-    #speedtest-start-btn { background: #2b6cb0; color: white; border: none; border-radius: 4px;
+    #speedtest-start-btn { background: var(--accent-blue-strong); color: white; border: none; border-radius: 4px;
                             padding: 0.5rem 1rem; font-size: 0.85rem; cursor: pointer; }
-    #speedtest-start-btn:disabled { background: #444; cursor: default; opacity: 0.7; }
-    #speedtest-result { background: #14161c; border: 1px solid #2a2d35; border-radius: 6px;
+    #speedtest-start-btn:disabled { background: var(--btn-disabled-bg); cursor: default; opacity: 0.7; }
+    #speedtest-result { background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 6px;
                          padding: 0.9rem; font-size: 0.85rem; min-height: 1.5rem; }
     .speedtest-metric { display: inline-block; margin-right: 2rem; }
     .speedtest-metric b { font-size: 1.2rem; display: block; }
-    .speedtest-progress-bar { background: #2a2d35; border-radius: 4px; height: 6px; margin-top: 0.6rem; overflow: hidden; }
-    .speedtest-progress-fill { background: #4a90e2; height: 100%; transition: width 0.3s; }
-    .active-wan-panel { display: flex; align-items: center; gap: 1rem; background: #14161c;
-                         border: 1px solid #2a2d35; border-radius: 6px; padding: 0.7rem 1rem; margin-bottom: 1rem; }
-    .active-wan-panel .wan-badge { background: #1c3a24; color: #3ecf6e; border-radius: 4px;
+    .speedtest-progress-bar { background: var(--border-color); border-radius: 4px; height: 6px; margin-top: 0.6rem; overflow: hidden; }
+    .speedtest-progress-fill { background: var(--accent-blue); height: 100%; transition: width 0.3s; }
+    .active-wan-panel { display: flex; align-items: center; gap: 1rem; background: var(--bg-card);
+                         border: 1px solid var(--border-color); border-radius: 6px; padding: 0.7rem 1rem; margin-bottom: 1rem; }
+    .active-wan-panel .wan-badge { background: var(--accent-green-bg); color: var(--accent-green); border-radius: 4px;
                                     padding: 0.2rem 0.6rem; font-weight: bold; font-size: 0.85rem; }
-    #failover-btn { background: #a33; color: white; border: none; border-radius: 4px;
+    #failover-btn { background: var(--accent-red-strong); color: white; border: none; border-radius: 4px;
                      padding: 0.5rem 1rem; font-size: 0.85rem; cursor: pointer; margin-left: auto; }
-    #failover-btn:hover:not(:disabled) { background: #c44; }
-    #failover-btn:disabled { background: #444; cursor: default; opacity: 0.7; }
+    #failover-btn:hover:not(:disabled) { background: var(--accent-red-strong-hover); }
+    #failover-btn:disabled { background: var(--btn-disabled-bg); cursor: default; opacity: 0.7; }
+    .danger-zone { margin-top: 3rem; padding: 1rem; border: 1px dashed var(--accent-red-soft);
+                    border-radius: 6px; background: color-mix(in srgb, var(--accent-red-soft) 6%, transparent); }
+    #truncate-db-btn { background: transparent; color: var(--accent-red-soft); border: 1px solid var(--accent-red-soft);
+                        border-radius: 4px; padding: 0.5rem 1rem; font-size: 0.85rem; cursor: pointer; }
+    #truncate-db-btn:hover:not(:disabled) { background: var(--accent-red-soft); color: white; }
+    #truncate-db-btn:disabled { opacity: 0.6; cursor: default; }
   </style>
 </head>
 <body>
@@ -149,6 +225,9 @@ PAGE = """
     </span>
     <button id="live-toggle-btn" class="live" onclick="toggleLive()">
       <span id="live-indicator" class="live"></span><span id="live-toggle-label">Live</span>
+    </button>
+    <button id="theme-toggle-btn" onclick="toggleTheme()">
+      <span id="theme-toggle-label">Light mode</span>
     </button>
     <span id="last-updated"></span>
   </div>
@@ -200,6 +279,16 @@ PAGE = """
     </tbody>
   </table>
 
+  <div class="danger-zone">
+    <h2 style="font-size:0.9rem; color: var(--accent-red-soft); margin: 0 0 0.5rem;">Danger Zone</h2>
+    <p style="color: var(--text-muted); font-size: 0.8rem; margin: 0 0 0.75rem;">
+      Permanently clears ping history, degradation windows, and failover event records
+      (chart, table, and CSV export data). Does NOT affect which WAN is currently active
+      or the monitor's operational state -- this only clears historical/reporting data.
+    </p>
+    <button id="truncate-db-btn" onclick="truncateDatabase()">Truncate Database</button>
+  </div>
+
   <script>
     const CURRENT_RANGE = {{ selected_range|tojson }};
     const DASHBOARD_TZ = {{ dashboard_timezone|tojson }};
@@ -216,13 +305,18 @@ PAGE = """
 
     // Fixed color-by-metric-type within each port's chart (per your
     // preference): blue for throughput, red for latency.
-    const RATE_COLOR = '#4a90e2';
-    const LATENCY_COLOR = '#d64545';
+    // Rate/latency colors are looked up live via themeColor() at chart-build
+    // time (see updateWanMetricsChart below) rather than cached here, since
+    // they need to reflect whichever theme is current after a toggle.
 
     // Formats a unix timestamp in DASHBOARD_TZ as "YYYY-MM-DD HH:MM:SS" --
     // explicit IANA zone via Intl, NOT the browser's local timezone, so the
     // on-screen table always matches the CSV export regardless of where
     // you're viewing this from.
+    function themeColor(varName) {
+      return getComputedStyle(document.documentElement).getPropertyValue(varName).trim();
+    }
+
     function fmtTs(ts) {
       const parts = new Intl.DateTimeFormat('en-US', {
         timeZone: DASHBOARD_TZ, hour12: false,
@@ -309,18 +403,18 @@ PAGE = """
           data: {
             labels: labels,
             datasets: [
-              { label: 'Latency (ms)', data: latency, borderColor: '#8ab4f8', yAxisID: 'y', pointRadius: 0, borderWidth: 1.5 },
-              { label: 'Loss (%)', data: loss, borderColor: '#f28b82', yAxisID: 'y1', pointRadius: 0, borderWidth: 1.5 },
+              { label: 'Latency (ms)', data: latency, borderColor: themeColor('--accent-link'), yAxisID: 'y', pointRadius: 0, borderWidth: 1.5 },
+              { label: 'Loss (%)', data: loss, borderColor: themeColor('--accent-red-soft'), yAxisID: 'y1', pointRadius: 0, borderWidth: 1.5 },
             ]
           },
           options: {
             animation: false,
             scales: {
-              x: { ticks: { maxTicksLimit: 8, color: '#999' }, grid: { color: '#222' } },
-              y: { type: 'linear', position: 'left', title: { display: true, text: 'ms' }, grid: { color: '#222' } },
+              x: { ticks: { maxTicksLimit: 8, color: themeColor('--chart-tick') }, grid: { color: themeColor('--chart-grid') } },
+              y: { type: 'linear', position: 'left', title: { display: true, text: 'ms' }, grid: { color: themeColor('--chart-grid') } },
               y1: { type: 'linear', position: 'right', title: { display: true, text: '%' }, grid: { display: false } },
             },
-            plugins: { legend: { labels: { color: '#ccc' } } }
+            plugins: { legend: { labels: { color: themeColor('--chart-legend') } } }
           }
         });
       } else {
@@ -428,11 +522,11 @@ PAGE = """
         const datasets = [
           {
             label: 'Throughput', data: port.data.map(d => d.totalRate),
-            borderColor: RATE_COLOR, yAxisID: 'y', pointRadius: 0, borderWidth: 1.5,
+            borderColor: themeColor('--accent-blue'), yAxisID: 'y', pointRadius: 0, borderWidth: 1.5,
           },
           {
             label: 'Latency', data: port.data.map(d => d.latency),
-            borderColor: LATENCY_COLOR, yAxisID: 'y1', pointRadius: 0, borderWidth: 1.5,
+            borderColor: themeColor('--accent-red'), yAxisID: 'y1', pointRadius: 0, borderWidth: 1.5,
           },
         ];
 
@@ -446,13 +540,13 @@ PAGE = """
             options: {
               animation: false,
               scales: {
-                x: { ticks: { maxTicksLimit: 8, color: '#999' }, grid: { color: '#222' } },
+                x: { ticks: { maxTicksLimit: 8, color: themeColor('--chart-tick') }, grid: { color: themeColor('--chart-grid') } },
                 // Unit is provisional -- see get_isp_load()'s docstring in
                 // omada_client.py, not yet confirmed against a live response.
-                y: { type: 'linear', position: 'left', title: { display: true, text: 'KB/s (unconfirmed unit)' }, grid: { color: '#222' } },
+                y: { type: 'linear', position: 'left', title: { display: true, text: 'KB/s (unconfirmed unit)' }, grid: { color: themeColor('--chart-grid') } },
                 y1: { type: 'linear', position: 'right', title: { display: true, text: 'ms' }, grid: { display: false } },
               },
-              plugins: { legend: { labels: { color: '#ccc' } } }
+              plugins: { legend: { labels: { color: themeColor('--chart-legend') } } }
             }
           });
         } else {
@@ -728,6 +822,63 @@ PAGE = """
       if (wanMetricsPollTimer !== null) { clearInterval(wanMetricsPollTimer); wanMetricsPollTimer = null; }
     }
 
+    function truncateDatabase() {
+      const typed = window.prompt(
+        'This will PERMANENTLY DELETE all ping history, degradation windows, and failover event records -- the chart, table, and CSV export data. This cannot be undone. It does NOT affect which WAN is currently active. Type DELETE (in capitals) to confirm:'
+      );
+      if (typed !== 'DELETE') {
+        if (typed !== null) alert('Confirmation text did not match -- nothing was deleted.');
+        return;
+      }
+
+      const btn = document.getElementById('truncate-db-btn');
+      btn.disabled = true;
+      btn.textContent = 'Truncating...';
+
+      fetch('/api/database/truncate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ confirm: true }),
+      }).then(r => r.json()).then(data => {
+        btn.disabled = false;
+        btn.textContent = 'Truncate Database';
+        if (data.success) {
+          loadData();
+          loadWanMetrics();
+        } else {
+          alert('Truncate failed: ' + data.error);
+        }
+      }).catch(err => {
+        btn.disabled = false;
+        btn.textContent = 'Truncate Database';
+        alert('Truncate failed: ' + err);
+      });
+    }
+
+    function toggleTheme() {
+      const html = document.documentElement;
+      const current = html.getAttribute('data-theme') || 'dark';
+      const next = current === 'dark' ? 'light' : 'dark';
+      html.setAttribute('data-theme', next);
+      localStorage.setItem('wan-monitor-theme', next);
+      document.getElementById('theme-toggle-label').textContent = next === 'dark' ? 'Light mode' : 'Dark mode';
+
+      // Chart.js renders to canvas, so it can't pick up new CSS variable
+      // values on its own the way the rest of the page does -- destroy and
+      // rebuild every chart instance so they're recreated reading the new
+      // theme's colors. Toggling is a rare, deliberate user action, so the
+      // extra rebuild cost here is a non-issue -- much simpler and more
+      // reliable than trying to surgically patch every live chart's option
+      // objects in place.
+      if (chartInstance) { chartInstance.destroy(); chartInstance = null; }
+      Object.values(wanPortChartInstances).forEach(c => c.destroy());
+      wanPortChartInstances = {};
+      wanPortTabsBuilt = false;  // forces buildWanPortTabs() to rebuild tab/canvas DOM fresh too
+
+      loadData();
+      loadWanMetrics();
+    }
+
     function toggleLive() {
       liveEnabled = !liveEnabled;
       const btn = document.getElementById('live-toggle-btn');
@@ -743,6 +894,12 @@ PAGE = """
         btn.className = 'paused'; indicator.className = 'paused'; label.textContent = 'Paused';
       }
     }
+
+    // Sync the toggle button's label to whatever theme the head-level
+    // inline script already applied (saved preference or OS default) --
+    // its static HTML text doesn't know which theme actually won.
+    document.getElementById('theme-toggle-label').textContent =
+      document.documentElement.getAttribute('data-theme') === 'dark' ? 'Light mode' : 'Dark mode';
 
     loadData();
     loadWanMetrics();
@@ -1020,6 +1177,29 @@ def api_failover():
         return jsonify({"success": True, "error": None, "newPrimary": current_backup, "newBackup": current_primary})
     except Exception as e:
         log.warning("Failed to trigger failover: %s", e)
+        return jsonify({"success": False, "error": str(e)})
+
+
+@app.route("/api/database/truncate", methods=["POST"])
+def api_database_truncate():
+    """
+    Clears historical data (ping cycles, failover events) -- the raw
+    material behind the chart, table, and CSV export. Deliberately does
+    NOT touch monitor_state (which WAN is active, persisted failed_over
+    flag) -- see truncate_history()'s docstring in db.py for why. Requires
+    {"confirm": true}, same pattern as /api/failover -- the frontend is
+    expected to have already gotten an explicit, real confirm dialog
+    before ever sending this.
+    """
+    body = request.get_json(silent=True) or {}
+    if not body.get("confirm"):
+        return jsonify({"success": False, "error": "Missing confirmation"}), 400
+
+    try:
+        db.truncate_history()
+        return jsonify({"success": True, "error": None})
+    except Exception as e:
+        log.warning("Failed to truncate database: %s", e)
         return jsonify({"success": False, "error": str(e)})
 
 

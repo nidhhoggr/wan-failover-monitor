@@ -22,7 +22,6 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
-    restart: unless-stopped
 
   wan-failover-dashboard:
     build: .
@@ -38,7 +37,6 @@ services:
       - "8090:8090"
     depends_on:
       - wan-failover-monitor
-    restart: unless-stopped
 
 volumes:
   wan-monitor-data:

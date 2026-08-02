@@ -67,6 +67,24 @@ def _connect():
         conn.close()
 
 
+def truncate_history():
+    """
+    Deletes all rows from `cycles` and `events` -- the historical/reporting
+    data (charts, degradation windows, CSV export). Deliberately does NOT
+    touch `monitor_state` -- wiping which WAN is currently active or the
+    persisted failed_over flag would make the monitor forget its real
+    operational state mid-flight, a different and more dangerous kind of
+    "reset" than just clearing historical charts. VACUUM reclaims the
+    actual disk space the deleted rows were using -- SQLite doesn't do
+    this automatically after a DELETE.
+    """
+    with _connect() as conn:
+        conn.execute("DELETE FROM cycles")
+        conn.execute("DELETE FROM events")
+        conn.commit()  # VACUUM cannot run inside an open transaction -- commit the deletes first
+        conn.execute("VACUUM")
+
+
 def init_db():
     with _connect() as conn:
         conn.executescript(_SCHEMA)

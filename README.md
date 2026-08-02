@@ -3,59 +3,144 @@
 Docker container that watches internet health from the LAN and, on
 sustained latency/packet-loss degradation, calls the Omada Open API to
 force a WAN failover on your ER605 -- faster and smarter-triggered than the
-router's default "is it completely down" failover.
+router's default "is it completely down" failover. A second container
+serves a live web dashboard (charts, alerts, manual controls) over the same
+data. See "Dashboard" below for the full feature list.
 
 ## Read this before deploying
 
-**A LAN-side container cannot independently probe WAN1 vs WAN2.** Whatever
-this container pings goes out through whichever WAN the router currently has
-active. So this design detects "the currently active path has gone bad" --
-it does not verify the backup is actually better before switching to it, and
-it can't watch a currently-inactive WAN's health in the background.
+**The trigger direction and the fail-back direction use different data
+sources, deliberately.**
 
-Two ways to close that gap, in order of how much I'd trust them:
+- **Trigger** (fail *over* to backup): LAN-side ping health. A container on
+  your LAN can't independently probe an inactive WAN, but for the trigger
+  decision that's fine -- "is whatever WAN is currently active bad" is
+  exactly the question you want answered, and that's what LAN-side pings
+  correctly measure.
+- **Fail-back** (return to primary): the router's own API-reported WAN
+  status (`check_primary_wan_health()`), not LAN-side pings. This one
+  genuinely needed the API, not just LAN pings -- see "Fail-back: why it's
+  based on primary WAN health" below for the full story of why the obvious
+  LAN-ping approach for this direction is actively wrong, not just less
+  accurate.
 
-1. **Use this as a smarter trigger for a decision the router already
-   supports well.** Omada gateways' native Link Backup/SLA feature does
-   real independent per-WAN echo tests (it pings out each WAN's own gateway
-   before any routing decision is made) and already supports latency and
-   packet-loss thresholds, not just up/down. Before building anything
-   custom, check Gateway > your ER605 > Preferential/Link Backup settings
-   for an SLA or "advanced" mode with configurable ping targets, interval,
-   and loss/latency thresholds. If that's available in your firmware, tuning
-   *that* directly is both more correct (true per-WAN visibility) and less
-   work than this whole container. I'd genuinely start there.
-
-2. **If you still want a custom decision-maker**, have it poll the
-   controller's Open API for the gateway's own per-WAN status (the same
-   telemetry the SLA feature already computes) instead of pinging from the
-   LAN. `omada_client.get_gateway()` is stubbed for this -- once you hit it
-   against your real controller you'll see whatever per-port latency/loss
-   fields your firmware reports, and you can drive the decision logic in
-   `monitor.py` off those instead of (or in addition to) the LAN-side pings.
-
-This repo, as shipped, implements the LAN-side fallback (option not-1) with
-hysteresis and a cooldown so it's a safe starting point, plus a periodic
-"fail back if things have been good for a while" so it doesn't get stuck on
-the backup link. Treat it as a bridge until you've evaluated option 1.
+Both paths are confirmed working end-to-end against a real ER605 on Omada
+Central, including live tests where traffic actually moved. Nothing here is
+a stubbed placeholder.
 
 ## Architecture
 
 ```
-+----------------------+       ping x3 targets        +-------------------+
-|  wan-failover-monitor | ----------------------------> |  1.1.1.1 / 8.8.8.8 |
-|  (this container)     |                                |  9.9.9.9 (etc.)    |
-|                        |                                +-------------------+
-|  every 5s: aggregate   |
-|  latency + loss ->     |        OAuth2 client-credentials + PATCH gateway
-|  hysteresis state      | -----------------------------------------------> Omada
-|  machine               |                                                  Controller
-+------------------------+                                                   |
-                                                                               v
-                                                                          ER605 gateway
-                                                                          (WAN priority
-                                                                           flipped)
++------------------------+     ping x3 targets      +---------------------+
+|  wan-failover-monitor   | -----------------------> |  1.1.1.1 / 8.8.8.8   |
+|  (trigger direction)     |                          |  9.9.9.9 (etc.)      |
+|                          |                          +---------------------+
+|  every 5s: aggregate     |
+|  latency + loss ->       |     OAuth2 + PUT internet/load-balance
+|  hysteresis state         | ------------------------------------------> Omada
+|  machine (trigger)         |                                           Controller
+|                              |     GET gateways/{mac}/wan-status              |
+|  every 30s: poll primary      | <---------------------------------------------+
+|  health -> stability window    |                                             v
+|  (fail-back)                     | ------------------------------------> ER605 gateway
++-----------+--------------+                                              (WAN priority
+            |  writes                                                      flipped)
+            v
+     +--------------+     reads      +----------------------+
+     |  sqlite db    | <------------ |  wan-failover-dashboard |
+     |  (named volume)|                |  Flask, port 8090       |
+     +--------------+                +----------------------+
+                                          |  also calls Omada API
+                                          |  directly for: alerts,
+                                          v  speed test, active-WAN,
+                                     Omada Controller  manual failover trigger
 ```
+
+## Dashboard
+
+The `wan-failover-dashboard` container serves a live web UI at
+`http://<host>:8090`, reading from the same sqlite db `monitor.py` writes to
+(WAL mode, safe single-writer/single-reader), plus making some of its own
+direct Omada API calls for things the monitor doesn't otherwise track
+(alerts, speed tests, live WAN status).
+
+**Latency & Loss chart** -- your own LAN-side ping data, the same signal
+that drives the failover trigger. Its title dynamically shows which WAN
+it's currently reporting on (e.g. "Latency & Loss (reporting on: WAN)"),
+since this necessarily reflects whichever WAN is currently active, not
+always the same physical link.
+
+**WAN Metrics** -- one tab per physical WAN port, each showing router-
+reported throughput (blue) and latency (red) together, straight from
+Omada's `dashboard/isp-load` endpoint -- independent of this monitor's own
+ping data, including for the currently-*inactive* WAN. This endpoint's data
+only updates roughly every 5 minutes server-side (confirmed via direct
+testing), so it polls on its own slower cadence
+(`DASHBOARD_ISP_LOAD_POLL_INTERVAL_SECONDS`, default 60s) with an honest
+"(data as of: Xm ago)" label, rather than implying real-time updates that
+aren't actually happening.
+
+**Degradation windows table + CSV export** -- contiguous runs of bad
+ping cycles collapsed into start/end/duration/avg+peak latency/avg+peak
+loss. This is *not* gated by the failover trigger threshold -- a single bad
+cycle shows up as a window on its own, independent of whether it ever grew
+into a real failover. Cross-reference against the "failover actions" stat
+(or the `events` table) if you need to know which windows actually
+triggered something. The CSV export is shaped for handing to an ISP as
+supporting evidence in an SLA dispute -- see the caveat below about what
+that evidence actually proves.
+
+**Active WAN + manual failover trigger** -- a badge showing current
+primary/backup, refreshed on the live-poll cycle so it reflects automatic
+failovers too, not just manual ones. The "Switch to X" button fetches live
+state fresh at click time and calls the exact same `set_active_wan()` used
+everywhere else in this project -- functionally identical to running
+`./test_load_balance_swap.sh failover` by hand, gated behind a real browser
+confirm dialog.
+
+**Alerts panel** -- top 3 unresolved Omada site alerts (newest first),
+pulled live via `logs/alerts`, with a working "Acknowledge" button that
+resolves the alert through the API (`logs/alerts/resolve`) and refreshes
+the list. Separate from this monitor's own degradation windows -- these are
+Omada's own alert log (device offline, etc.), not derived from ping data.
+
+**Speed Test** -- select a WAN, click Start, watch a live progress bar via
+polling (`gateways/{mac}/speedTest` + `speedTestResult`). Checks
+`osgCap.speedTest` up front and hides the button entirely with an
+explanation if your gateway/firmware doesn't support it via the API --
+confirmed this is a real, common limitation on some ER605 firmware
+versions (TP-Link only added API speed test support around firmware 2.4.0,
+and even that had rocky early reports -- see git history / conversation
+log for the full investigation if you hit this).
+
+**Live refresh** -- polls every `DASHBOARD_REFRESH_INTERVAL_SECONDS`
+(default 15s) for most panels, with a Live/Paused toggle. WAN Metrics polls
+separately and slower (see above) since its underlying data can't change
+that often regardless of how often you ask.
+
+**Light/dark theme** -- toggle next to the Live button, defaults to your
+OS-level preference, persists via `localStorage`.
+
+**Danger Zone -> Truncate Database** -- clears ping-cycle/event history
+(chart, table, CSV data) but deliberately does NOT touch `monitor_state`
+(which WAN is active, the persisted `failed_over` flag) -- wiping that
+would make the monitor forget its real operational state mid-flight, a
+different and more dangerous kind of reset than just clearing historical
+charts. Gated behind typing `DELETE` to confirm, not just a yes/no dialog,
+given it's genuinely irreversible.
+
+**Timezone** -- the table and CSV export use `DASHBOARD_TIMEZONE` (default
+`America/Los_Angeles`, DST-aware), not the container's default UTC. The
+chart used to use your browser's local timezone instead, which was
+inconsistent with the table -- both now use the same explicit configured
+zone via `Intl.DateTimeFormat`.
+
+**Note on what the CSV proves to an ISP**: these are round-trip times and
+loss to public resolvers as seen from your LAN, not a certified line-
+quality measurement -- useful as your own supporting evidence, but don't
+expect an ISP to treat a self-hosted CSV as authoritative the way they'd
+treat their own NOC's monitoring. It's leverage for a conversation, not a
+legal instrument.
 
 ## Setup
 
@@ -110,10 +195,9 @@ or controller upgrade, since TP-Link has changed these paths before.
 5. **Copy `.env.example` to `.env` and fill it in.** Leave `DRY_RUN=true`.
 
 6. **Run it and watch the logs for at least a day** before flipping
-   `DRY_RUN=false`:
-   ```
-   docker compose up --build
-   ```
+   `DRY_RUN=false` (see "Operations: Docker commands" below for the full
+   command reference -- `docker compose up -d --build` to start,
+   `docker compose logs -f wan-failover-monitor` to watch):
    You're looking for: does it ever hit `CONSECUTIVE_BAD_TO_TRIGGER` when
    the network was actually fine (false positive)? Tune
    `LATENCY_THRESHOLD_MS` / `PACKET_LOSS_THRESHOLD_PCT` /
@@ -364,54 +448,113 @@ across restarts specifically so this works -- without it, a fresh process
 always starts assuming it's on the primary WAN, which would be wrong (and
 untestable this way) if the container restarts while genuinely failed over.
 
-## Dashboard / ISP reporting
-
-`monitor.py` now writes every check cycle and every failover/fail-back
-event to a shared SQLite db (`/data/wan-monitor.db` inside the containers,
-persisted via the `wan-monitor-data` named volume so it survives rebuilds).
-A second container, `wan-failover-dashboard`, serves a read-only web UI over
-that data at `http://<this-host>:8090`:
-
-- a latency/loss timeseries chart over a selectable window (6h/24h/7d/30d/90d)
-- a table of **degradation windows** -- contiguous runs of bad cycles
-  collapsed into start/end/duration/avg+peak latency/avg+peak loss, which is
-  the shape you actually want for an ISP dispute rather than a raw
-  per-5-second dump
-- a "Download ISP report (CSV)" button exporting exactly that table for the
-  selected range
-
-Both containers read/write the same SQLite file in WAL mode, which safely
-supports this single-writer/single-reader pattern without needing a separate
-database server.
-
-Old rows are pruned automatically after `RETENTION_DAYS` (90 by default) --
-raise it in `.env` if you want a longer history for a longer-running SLA
-dispute, keeping in mind `CHECK_INTERVAL_SECONDS=5` means roughly 17k rows/day.
-
-**Note on what this proves to an ISP**: these are round-trip times and loss
-to public resolvers as seen from your LAN, not a certified line-quality
-measurement -- useful as your own supporting evidence, but don't expect an
-ISP to treat a self-hosted CSV as authoritative the way they would their own
-NOC's monitoring. It's leverage for a conversation, not a legal instrument.
-
 ## Files
 
-- `monitor.py` -- main loop: ping aggregation, hysteresis state machine,
-  optional throughput sampling, calls into `omada_client`, persists to `db`.
-- `omada_client.py` -- OAuth2 client-credentials auth + gateway/WAN config
-  calls, all confirmed working against a real ER605 (see docstrings for
-  which endpoint/verb each one hits).
+- `monitor.py` -- main loop: ping aggregation, hysteresis trigger state
+  machine, primary-health-based fail-back with stability window, optional
+  throughput sampling, calls into `omada_client`, persists to `db`.
+- `omada_client.py` -- OAuth2 client-credentials auth + every confirmed
+  Omada Open API call this project uses (gateway status, WAN config/status,
+  load-balance read/write, alert logs read/resolve, ISP load stats, speed
+  test start/result) -- see each method's docstring for the exact
+  endpoint/verb and confirmation status.
+- `db.py` -- shared SQLite persistence: cycles, events, degradation-window
+  aggregation, persisted `monitor_state` (survives restarts), and
+  `truncate_history()` for the dashboard's Danger Zone.
+- `dashboard.py` -- Flask app serving the full web UI described above.
 - `get_site_id.sh` -- standalone script to look up your `OMADA_SITE_ID`.
 - `get_wan_ports_config.sh` -- standalone script to call any Open API GET
-  endpoint by path, used to find the real WAN `portId` values.
+  endpoint by path (with query string support), used throughout this
+  project's development to find and verify real endpoints before wiring
+  them into code.
 - `test_load_balance_swap.sh` -- standalone script to test/re-verify the
   actual failover write call (`show`/`failover`/`failback`), with typed
-  confirmation before any live write.
-- `db.py` -- shared SQLite persistence (cycles, events, degradation-window
-  aggregation) used by both `monitor.py` and `dashboard.py`.
-- `dashboard.py` -- Flask app: chart, degradation-window table, CSV export.
+  confirmation before any live write. The dashboard's manual failover
+  button does functionally the same thing via the API directly.
 - `Dockerfile`, `docker-compose.yml` -- builds one image, runs it as two
   services (`wan-failover-monitor` and `wan-failover-dashboard`) sharing a
-  named volume for the sqlite db. Monitor container grants only
-  `CAP_NET_RAW` (needed for `ping`) rather than running as root.
-- `.env.example` -- every tunable, documented inline.
+  named volume for the sqlite db and the same `.env` file. Monitor
+  container grants only `CAP_NET_RAW` (needed for `ping`) rather than
+  running as root.
+- `.env.example` -- every tunable, documented inline. This is the
+  authoritative reference for configuration -- if a setting isn't
+  mentioned in this README, check there first.
+
+## Operations: Docker commands
+
+**First-time setup**, after `.env` is filled in (see Setup above):
+```bash
+docker compose up -d --build
+```
+`-d` runs detached (background). Both containers start; dashboard is at
+`http://<host>:8090`.
+
+**After editing `.env`** (any variable) -- env vars are only read once at
+process start, so the running container has no way to know the file
+changed. `docker compose restart` does NOT reload `.env` either -- it
+restarts the existing container without re-reading it. You need to
+recreate:
+```bash
+docker compose up -d --force-recreate wan-failover-monitor
+# and/or, if the change affects the dashboard (e.g. OMADA_* vars, DASHBOARD_*):
+docker compose up -d --force-recreate wan-failover-dashboard
+```
+No `--build` needed here since no code changed, just config.
+
+**After editing any `.py` file** (`monitor.py`, `db.py`, `omada_client.py`,
+`dashboard.py`) -- a real rebuild is required, `--force-recreate` alone
+reuses the old image:
+```bash
+docker compose up -d --build --force-recreate
+```
+If you suspect Docker's build cache is serving stale layers (rare, but
+possible after Docker Desktop updates or unusual host state), force a
+completely clean rebuild:
+```bash
+docker compose down
+docker compose build --no-cache
+docker compose up -d
+```
+
+**Logs**:
+```bash
+docker compose logs -f wan-failover-monitor      # monitor only, follow
+docker compose logs -f wan-failover-dashboard    # dashboard only, follow
+docker compose logs -f                           # both, interleaved
+docker compose logs --tail=100 wan-failover-monitor   # last 100 lines, no follow
+docker compose logs -t wan-failover-monitor           # with timestamps
+docker compose logs --since 30m wan-failover-monitor  # last 30 minutes
+```
+Ctrl+C stops following (containers keep running). Log rotation is capped
+at 10MB x 3 files per container (see `docker-compose.yml`'s `logging`
+block) -- old entries roll off; for anything you need to keep long-term,
+rely on the dashboard's sqlite history instead of container logs.
+
+**Status / is it actually running**:
+```bash
+docker compose ps
+docker inspect wan-failover-monitor --format '{{.Created}}'   # when the container was created
+docker exec wan-failover-monitor grep -n "SOME_STRING" monitor.py  # confirm what code is actually inside a running container
+```
+That last pattern -- grepping inside the live container -- is the reliable
+way to confirm a rebuild actually picked up a code change, rather than
+trusting container-creation timestamps (which update on `--force-recreate`
+even if the underlying image is stale).
+
+**Stop / remove**:
+```bash
+docker compose stop              # stop both, keep containers/volumes for later
+docker compose down              # stop and remove containers (volumes/db persist)
+docker compose down -v           # also destroy the named volume -- WIPES THE DATABASE, rarely what you want
+docker rm -f wan-failover-monitor wan-failover-dashboard   # force-remove a specific stuck container by name
+```
+
+**Quick health check on the sqlite db directly** (useful when debugging
+dashboard issues without going through the web UI):
+```bash
+docker exec wan-failover-dashboard python3 -c "
+import db
+print(len(db.fetch_cycles(0)), 'total cycles')
+print(db.get_monitor_state())
+"
+```
