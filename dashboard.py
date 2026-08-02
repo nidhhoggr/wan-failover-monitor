@@ -56,6 +56,7 @@ DASHBOARD_TIMEZONE = os.environ.get("DASHBOARD_TIMEZONE", "America/Los_Angeles")
 _TZ = ZoneInfo(DASHBOARD_TIMEZONE)
 
 REFRESH_INTERVAL_SECONDS = int(os.environ.get("DASHBOARD_REFRESH_INTERVAL_SECONDS", "15"))
+ISP_LOAD_REFRESH_INTERVAL_SECONDS = int(os.environ.get("DASHBOARD_ISP_LOAD_POLL_INTERVAL_SECONDS", "60"))
 
 RANGE_OPTIONS = {
     "6h": 6 * 3600,
@@ -174,7 +175,9 @@ PAGE = """
   <h2 id="ping-chart-title" style="font-size:1rem; margin: 1.5rem 0 0.5rem;">Latency &amp; Loss</h2>
   <canvas id="chart" height="90"></canvas>
 
-  <h2 style="font-size:1rem; margin: 1.5rem 0 0.5rem;">WAN Metrics (router-reported)</h2>
+  <h2 style="font-size:1rem; margin: 1.5rem 0 0.5rem;">
+    WAN Metrics (router-reported) <span id="wan-metrics-data-age" style="color:#888; font-size:0.78rem; font-weight:normal;"></span>
+  </h2>
   <div class="wan-metrics-tabs" id="wan-metrics-tabs"></div>
   <div id="wan-metrics-error" class="alerts-error" style="display:none;"></div>
   <div id="wan-metrics-charts"></div>
@@ -201,6 +204,7 @@ PAGE = """
     const CURRENT_RANGE = {{ selected_range|tojson }};
     const DASHBOARD_TZ = {{ dashboard_timezone|tojson }};
     const REFRESH_MS = {{ refresh_interval_seconds }} * 1000;
+    const ISP_LOAD_REFRESH_MS = {{ isp_load_refresh_interval_seconds }} * 1000;
 
     let chartInstance = null;
     let wanPortChartInstances = {};  // keyed by portId -- built dynamically since port count/names come from the API
@@ -208,6 +212,7 @@ PAGE = """
     let activeWanPortTab = null;
     let liveEnabled = true;
     let pollTimer = null;
+    let wanMetricsPollTimer = null;
 
     // Fixed color-by-metric-type within each port's chart (per your
     // preference): blue for throughput, red for latency.
@@ -390,6 +395,23 @@ PAGE = """
 
       const ports = resp.ports || [];
       if (ports.length === 0) return;
+
+      // Honest freshness indicator: when the underlying DATA last changed,
+      // not when we last polled for it. This endpoint's data only updates
+      // roughly every 5 minutes server-side (confirmed via direct testing --
+      // identical responses 5s apart) -- our poll interval being shorter
+      // than that doesn't make the data any fresher, so say so explicitly
+      // rather than implying real-time updates that aren't actually happening.
+      const latestTimes = ports.map(p => p.data.length ? p.data[p.data.length - 1].time : 0);
+      const mostRecentTime = Math.max(...latestTimes, 0);
+      const ageEl = document.getElementById('wan-metrics-data-age');
+      if (ageEl && mostRecentTime > 0) {
+        const ageSeconds = Math.max(0, Math.floor(Date.now() / 1000) - mostRecentTime);
+        const ageMinutes = Math.floor(ageSeconds / 60);
+        ageEl.textContent = ageMinutes < 1
+          ? '(data as of: just now)'
+          : `(data as of: ${ageMinutes}m ago -- this endpoint updates roughly every 5min)`;
+      }
 
       // Rebuild tabs/canvases only once, or if the actual set of ports
       // changes (e.g. a port added/removed) -- not on every refresh, which
@@ -675,14 +697,12 @@ PAGE = """
         fetch(`/api/windows?range=${CURRENT_RANGE}`).then(r => r.json()),
         fetch(`/api/events?range=${CURRENT_RANGE}`).then(r => r.json()),
         fetch(`/api/alerts`).then(r => r.json()),
-        fetch(`/api/isp-load?range=${CURRENT_RANGE}`).then(r => r.json()),
         fetch(`/api/active-wan`).then(r => r.json()),
-      ]).then(([cycles, windows, events, alerts, ispLoad, activeWan]) => {
+      ]).then(([cycles, windows, events, alerts, activeWan]) => {
         updateChart(cycles);
         renderTable(windows);
         renderStats(windows, events);
         renderAlerts(alerts);
-        updateWanMetricsChart(ispLoad);
         renderActiveWan(activeWan);
         document.getElementById('last-updated').textContent =
           'Updated ' + new Date().toLocaleTimeString();
@@ -692,13 +712,20 @@ PAGE = """
       });
     }
 
+    function loadWanMetrics() {
+      fetch(`/api/isp-load?range=${CURRENT_RANGE}`).then(r => r.json())
+        .then(ispLoad => updateWanMetricsChart(ispLoad))
+        .catch(err => console.error('Failed to load WAN metrics:', err));
+    }
+
     function startPolling() {
-      if (pollTimer !== null) return;
-      pollTimer = setInterval(loadData, REFRESH_MS);
+      if (pollTimer === null) pollTimer = setInterval(loadData, REFRESH_MS);
+      if (wanMetricsPollTimer === null) wanMetricsPollTimer = setInterval(loadWanMetrics, ISP_LOAD_REFRESH_MS);
     }
 
     function stopPolling() {
       if (pollTimer !== null) { clearInterval(pollTimer); pollTimer = null; }
+      if (wanMetricsPollTimer !== null) { clearInterval(wanMetricsPollTimer); wanMetricsPollTimer = null; }
     }
 
     function toggleLive() {
@@ -708,7 +735,8 @@ PAGE = """
       const label = document.getElementById('live-toggle-label');
       if (liveEnabled) {
         startPolling();
-        loadData();  // refresh immediately on resume, don't wait for the next interval tick
+        loadData();       // refresh immediately on resume, don't wait for the next interval tick
+        loadWanMetrics();
         btn.className = 'live'; indicator.className = 'live'; label.textContent = 'Live';
       } else {
         stopPolling();
@@ -717,6 +745,7 @@ PAGE = """
     }
 
     loadData();
+    loadWanMetrics();
     startPolling();
     loadWanPortsForSpeedTest();
   </script>
@@ -746,6 +775,7 @@ def index():
         selected_range=selected_range,
         dashboard_timezone=DASHBOARD_TIMEZONE,
         refresh_interval_seconds=REFRESH_INTERVAL_SECONDS,
+        isp_load_refresh_interval_seconds=ISP_LOAD_REFRESH_INTERVAL_SECONDS,
     )
 
 
