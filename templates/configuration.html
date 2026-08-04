@@ -1,0 +1,268 @@
+
+<!doctype html>
+<html>
+<head>
+  <script>
+    (function () {
+      var saved = localStorage.getItem('wan-monitor-theme');
+      var theme = saved || (window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+      document.documentElement.setAttribute('data-theme', theme);
+    })();
+  </script>
+  <meta charset="utf-8">
+  <title>Configuration - WAN Failover Monitor</title>
+  <style>
+    :root {
+      --bg-page: #0f1115; --bg-card: #14161c; --bg-card-alt: #1a1d24; --bg-card-active: #2b2f38;
+      --border-color: #2a2d35; --border-color-strong: #333; --text-primary: #e6e6e6;
+      --text-secondary: #999; --text-muted: #888; --accent-link: #8ab4f8; --accent-blue: #4a90e2;
+      --accent-blue-strong: #2b6cb0; --accent-green: #3ecf6e; --accent-green-bg: #1c3a24;
+      --accent-red-soft: #f28b82; --btn-disabled-bg: #444;
+    }
+    [data-theme="light"] {
+      --bg-page: #f5f6f8; --bg-card: #ffffff; --bg-card-alt: #eef0f3; --bg-card-active: #dde3ea;
+      --border-color: #d8dce2; --border-color-strong: #c5cad2; --text-primary: #1a1d24;
+      --text-secondary: #5b6270; --text-muted: #757c8a; --accent-link: #2b6cb0; --accent-blue: #2b6cb0;
+      --accent-blue-strong: #2b6cb0; --accent-green: #1f9950; --accent-green-bg: #dff3e6;
+      --accent-red-soft: #c53030; --btn-disabled-bg: #ccc;
+    }
+    body { font-family: -apple-system, Helvetica, Arial, sans-serif; margin: 2rem; max-width: 900px;
+           background: var(--bg-page); color: var(--text-primary); }
+    h1 { font-size: 1.3rem; }
+    .top-nav { display: flex; gap: 1.5rem; margin-bottom: 1.5rem; padding-bottom: 1rem;
+               border-bottom: 1px solid var(--border-color-strong); }
+    .top-nav a { color: var(--text-secondary); text-decoration: none; font-size: 0.95rem; padding-bottom: 0.3rem; }
+    .top-nav a.active { color: var(--text-primary); font-weight: bold; border-bottom: 2px solid var(--accent-blue); }
+    .restart-banner { background: var(--accent-green-bg); color: var(--accent-green); border-radius: 6px;
+                       padding: 0.8rem 1rem; margin-bottom: 1.5rem; font-size: 0.85rem; }
+    .settings-section { margin-bottom: 2rem; }
+    .settings-section h2 { font-size: 1rem; border-bottom: 1px solid var(--border-color-strong); padding-bottom: 0.4rem; }
+    .field-row { display: flex; align-items: center; gap: 0.75rem; padding: 0.6rem 0; border-bottom: 1px solid var(--border-color); }
+    .field-label { flex: 0 0 280px; }
+    .field-label .field-key { font-family: monospace; font-size: 0.78rem; color: var(--text-muted); display: block; }
+    .field-label .field-desc { font-size: 0.82rem; }
+    .field-input-wrap { flex: 1; display: flex; align-items: center; gap: 0.4rem; }
+    .field-input-wrap input {
+      flex: 1; background: var(--bg-card-alt); color: var(--text-primary); border: 1px solid var(--border-color-strong);
+      border-radius: 4px; padding: 0.4rem 0.6rem; font-size: 0.85rem; font-family: monospace;
+    }
+    .eye-toggle { background: transparent; border: 1px solid var(--border-color-strong); border-radius: 4px;
+                  padding: 0.35rem 0.5rem; cursor: pointer; color: var(--text-secondary); font-size: 0.9rem; }
+    .source-badge { font-size: 0.7rem; padding: 0.1rem 0.45rem; border-radius: 10px; white-space: nowrap; }
+    .source-database { background: var(--accent-green-bg); color: var(--accent-green); }
+    .source-env { background: var(--bg-card-alt); color: var(--text-secondary); }
+    .source-default { background: var(--bg-card-alt); color: var(--text-muted); }
+    #save-btn { background: var(--accent-blue-strong); color: white; border: none; border-radius: 4px;
+                padding: 0.6rem 1.2rem; font-size: 0.9rem; cursor: pointer; margin: 1.5rem 0; }
+    #save-btn:disabled { background: var(--btn-disabled-bg); cursor: default; }
+    #apply-restart-btn { background: transparent; color: var(--accent-green); border: 1px solid var(--accent-green);
+                          border-radius: 4px; padding: 0.6rem 1.2rem; font-size: 0.9rem; cursor: pointer; margin-left: 0.5rem; }
+    #apply-restart-btn:hover:not(:disabled) { background: var(--accent-green); color: white; }
+    #apply-restart-btn:disabled { opacity: 0.6; cursor: default; }
+    #save-status { font-size: 0.85rem; margin-left: 1rem; }
+    .danger-zone { margin-top: 3rem; padding: 1rem; border: 1px dashed var(--accent-red-soft);
+                    border-radius: 6px; background: color-mix(in srgb, var(--accent-red-soft) 6%, transparent); }
+    #reset-config-btn { background: transparent; color: var(--accent-red-soft); border: 1px solid var(--accent-red-soft);
+                        border-radius: 4px; padding: 0.5rem 1rem; font-size: 0.85rem; cursor: pointer; }
+    #reset-config-btn:hover:not(:disabled) { background: var(--accent-red-soft); color: white; }
+  </style>
+</head>
+<body>
+  <div class="top-nav">
+    <a href="/">Dashboard</a>
+    <a href="/configuration" class="active">Configuration</a>
+    <a href="/docs">Docs</a>
+  </div>
+
+  <h1>Configuration</h1>
+
+  <div class="restart-banner">
+    Saved changes are written immediately but only take effect after the services restart.
+    Use <b>Save Changes</b> below, then <b>Apply &amp; Restart</b> -- it restarts both services
+    automatically (about 10-30 seconds, monitoring resumes on its own). No docker commands
+    needed. Exception: the two WAN display labels apply live on the next refresh, no restart
+    required. (Fallback if the button is ever unavailable:
+    <code>docker compose up -d --force-recreate</code> on the host.)
+  </div>
+
+  <form id="config-form" onsubmit="return false;">
+    {% for section_name, fields in sections %}
+    <div class="settings-section">
+      <h2>{{ section_name }}</h2>
+      {% for f in fields %}
+      <div class="field-row">
+        <div class="field-label">
+          <span class="field-key">{{ f.key }}</span>
+          <span class="field-desc">{{ f.description }}</span>
+        </div>
+        <div class="field-input-wrap">
+          <input
+            type="{{ 'password' if f.sensitive else 'text' }}"
+            id="field-{{ f.key }}"
+            data-key="{{ f.key }}"
+            placeholder="(using {{ f.source }}: {{ f.value if not f.sensitive else '••••••••' }})"
+            value=""
+          >
+          {% if f.sensitive %}
+          <button type="button" class="eye-toggle" onclick="toggleVisibility('field-{{ f.key }}', this)">&#128065;</button>
+          {% endif %}
+          <span class="source-badge source-{{ f.source }}">{{ f.source }}</span>
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+    {% endfor %}
+
+    <button id="save-btn" type="button" onclick="saveAllSettings()">Save Changes</button>
+    <button id="apply-restart-btn" type="button" onclick="applyRestart()">Apply &amp; Restart</button>
+    <span id="save-status"></span>
+  </form>
+
+  <div class="danger-zone">
+    <h2 style="font-size:0.9rem; color: var(--accent-red-soft); margin: 0 0 0.5rem;">Danger Zone</h2>
+    <p style="color: var(--text-muted); font-size: 0.8rem; margin: 0 0 0.75rem;">
+      Deletes every saved override, reverting all settings back to whatever <code>.env</code> or the
+      built-in default provides. Does not touch <code>.env</code> itself or the monitoring database
+      (history, degradation windows, etc.) -- only the Configuration overrides saved through this page.
+    </p>
+    <button id="reset-config-btn" onclick="resetConfiguration()">Reset All to .env Defaults</button>
+  </div>
+
+  <script>
+    function toggleVisibility(inputId, btn) {
+      const input = document.getElementById(inputId);
+      input.type = input.type === 'password' ? 'text' : 'password';
+    }
+
+    function saveAllSettings() {
+      const inputs = document.querySelectorAll('#config-form input[data-key]');
+      const values = {};
+      inputs.forEach(inp => {
+        // Only send fields the user actually typed something into -- an
+        // empty field means "leave using env/default," not "overwrite
+        // with emptiness." The placeholder already shows what's currently
+        // effective, so leaving a field blank is a deliberate no-op.
+        if (inp.value !== '') values[inp.dataset.key] = inp.value;
+      });
+
+      const btn = document.getElementById('save-btn');
+      const status = document.getElementById('save-status');
+      btn.disabled = true;
+      status.textContent = 'Saving...';
+      status.style.color = '';
+
+      fetch('/api/config/save', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ values: values }),
+      }).then(r => r.json()).then(data => {
+        btn.disabled = false;
+        if (data.success) {
+          status.textContent = `Saved ${data.saved_count} setting(s). Click Apply & Restart to put them into effect.`;
+          status.style.color = 'var(--accent-green)';
+          setTimeout(() => location.reload(), 1200);
+        } else {
+          status.textContent = 'Save failed: ' + data.error;
+          status.style.color = 'var(--accent-red-soft)';
+        }
+      }).catch(err => {
+        btn.disabled = false;
+        status.textContent = 'Save failed: ' + err;
+        status.style.color = 'var(--accent-red-soft)';
+      });
+    }
+
+    function applyRestart() {
+      const confirmed = window.confirm(
+        'This restarts both services so saved configuration takes effect.\n\n' +
+        'The dashboard will be briefly unavailable (about 10-30 seconds) and this page will ' +
+        'reload automatically when it\'s back. Network monitoring resumes on its own.\n\nProceed?'
+      );
+      if (!confirmed) return;
+
+      const btn = document.getElementById('apply-restart-btn');
+      const status = document.getElementById('save-status');
+      btn.disabled = true;
+      document.getElementById('save-btn').disabled = true;
+      btn.textContent = 'Restarting...';
+      status.textContent = 'Restart requested -- waiting for services to come back...';
+      status.style.color = '';
+
+      fetch('/api/restart', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ confirm: true }),
+      }).then(r => r.json()).then(data => {
+        if (!data.success) {
+          btn.disabled = false;
+          document.getElementById('save-btn').disabled = false;
+          btn.textContent = 'Apply & Restart';
+          status.textContent = 'Restart failed: ' + data.error;
+          status.style.color = 'var(--accent-red-soft)';
+          return;
+        }
+        // The server exits ~0.7s after responding. Poll until it's back,
+        // then reload so the page reflects the freshly-applied config.
+        // Give the process a moment to actually go down first, so an
+        // early poll can't hit the OLD still-running process and reload
+        // prematurely into a stale page.
+        setTimeout(() => pollUntilBack(0), 2500);
+      }).catch(() => {
+        // fetch itself failing here usually means the server exited before
+        // the response fully flushed -- treat it the same as success and
+        // start polling for the restart.
+        setTimeout(() => pollUntilBack(0), 2500);
+      });
+    }
+
+    function pollUntilBack(attempt) {
+      const status = document.getElementById('save-status');
+      if (attempt > 40) {  // ~60s at 1.5s intervals -- something's wrong
+        status.textContent = 'Services have not come back after 60s -- check `docker compose ps` on the host.';
+        status.style.color = 'var(--accent-red-soft)';
+        return;
+      }
+      fetch('/', { cache: 'no-store' }).then(r => {
+        if (r.ok) { location.reload(); }
+        else { setTimeout(() => pollUntilBack(attempt + 1), 1500); }
+      }).catch(() => {
+        setTimeout(() => pollUntilBack(attempt + 1), 1500);
+      });
+    }
+
+    function resetConfiguration() {
+      const typed = window.prompt(
+        'This will delete ALL saved Configuration overrides, reverting every setting to whatever ' +
+        '.env or the built-in default provides.\n\nThis cannot be undone (though you can always ' +
+        're-save values afterward).\n\nType RESET (in capitals) to confirm:'
+      );
+      if (typed !== 'RESET') {
+        if (typed !== null) alert('Confirmation text did not match -- nothing was reset.');
+        return;
+      }
+
+      const btn = document.getElementById('reset-config-btn');
+      btn.disabled = true;
+      btn.textContent = 'Resetting...';
+
+      fetch('/api/config/reset', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ confirm: true }),
+      }).then(r => r.json()).then(data => {
+        btn.disabled = false;
+        btn.textContent = 'Reset All to .env Defaults';
+        if (data.success) {
+          location.reload();
+        } else {
+          alert('Reset failed: ' + data.error);
+        }
+      }).catch(err => {
+        btn.disabled = false;
+        btn.textContent = 'Reset All to .env Defaults';
+        alert('Reset failed: ' + err);
+      });
+    }
+  </script>
+</body>
+</html>

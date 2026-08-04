@@ -1,0 +1,145 @@
+
+<!doctype html>
+<html>
+<head>
+  <script>
+    (function () {
+      var saved = localStorage.getItem('wan-monitor-theme');
+      var theme = saved || (window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+      document.documentElement.setAttribute('data-theme', theme);
+    })();
+  </script>
+  <meta charset="utf-8">
+  <title>Docs - WAN Failover Monitor</title>
+  <style>
+    :root {
+      --bg-page: #0f1115; --bg-card: #14161c; --bg-card-alt: #1a1d24;
+      --border-color: #2a2d35; --border-color-strong: #333; --text-primary: #e6e6e6;
+      --text-secondary: #999; --text-muted: #888; --accent-link: #8ab4f8; --accent-blue: #4a90e2;
+    }
+    [data-theme="light"] {
+      --bg-page: #f5f6f8; --bg-card: #ffffff; --bg-card-alt: #eef0f3;
+      --border-color: #d8dce2; --border-color-strong: #c5cad2; --text-primary: #1a1d24;
+      --text-secondary: #5b6270; --text-muted: #757c8a; --accent-link: #2b6cb0; --accent-blue: #2b6cb0;
+    }
+    body { font-family: -apple-system, Helvetica, Arial, sans-serif; margin: 2rem; max-width: 800px;
+           background: var(--bg-page); color: var(--text-primary); line-height: 1.55; }
+    h1 { font-size: 1.3rem; }
+    .top-nav { display: flex; gap: 1.5rem; margin-bottom: 1.5rem; padding-bottom: 1rem;
+               border-bottom: 1px solid var(--border-color-strong); }
+    .top-nav a { color: var(--text-secondary); text-decoration: none; font-size: 0.95rem; padding-bottom: 0.3rem; }
+    .top-nav a.active { color: var(--text-primary); font-weight: bold; border-bottom: 2px solid var(--accent-blue); }
+    .doc-section { background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 6px;
+                    padding: 1.1rem 1.3rem; margin-bottom: 1rem; }
+    .doc-section h2 { font-size: 1.02rem; margin: 0 0 0.5rem; }
+    .doc-section p { font-size: 0.9rem; color: var(--text-primary); margin: 0.4rem 0; }
+    code { background: var(--bg-card-alt); padding: 0.1rem 0.35rem; border-radius: 3px; font-size: 0.85em; }
+  </style>
+</head>
+<body>
+  <div class="top-nav">
+    <a href="/">Dashboard</a>
+    <a href="/configuration">Configuration</a>
+    <a href="/docs" class="active">Docs</a>
+  </div>
+
+  <h1>What This Dashboard Shows</h1>
+  <p style="color: var(--text-muted); font-size: 0.85rem; margin-bottom: 1.5rem;">
+    A plain-language walkthrough of each section, top to bottom, as you'd actually encounter it.
+  </p>
+
+  <div class="doc-section">
+    <h2>Top bar (Range / Live / Light-Dark)</h2>
+    <p>"Range" picks how far back in time you're looking -- the last 6 hours, 24 hours, a week, a
+    month, or three months. "Live" controls whether the page keeps updating itself automatically
+    every 15 seconds or has been paused. The other button just switches between a dark or light
+    color scheme -- purely cosmetic, no effect on the data.</p>
+  </div>
+
+  <div class="doc-section">
+    <h2>Active WAN panel</h2>
+    <p>Tells you, right now, which internet connection is actually in use -- your main one or the
+    backup -- and shows the other one's name for reference. If something's gone wrong and the
+    system had to switch to the backup, this is where you'd see that at a glance. The
+    "Switch to [other connection]" button lets you manually force a switch, with a confirmation
+    prompt first since it's a real action that affects live traffic.</p>
+  </div>
+
+  <div class="doc-section">
+    <h2>The three summary numbers</h2>
+    <p>Degradation windows / total degraded time / failover actions -- a quick scorecard for
+    whatever time range is selected: how many separate stretches of bad internet were detected, how
+    many total minutes that added up to, and how many times the system actually decided to switch
+    connections because of it. The first number can be much bigger than the last -- a brief 10-second
+    hiccup counts as a "degradation window" even if it was never serious enough to trigger an actual
+    switch.</p>
+  </div>
+
+  <div class="doc-section">
+    <h2>Unresolved Alerts</h2>
+    <p>Pulls directly from the router/network system's own built-in alert log -- things like a
+    device going offline, not something this dashboard invented itself. Each one can be marked as
+    handled ("Acknowledge") once it's been dealt with, which removes it from this list.</p>
+  </div>
+
+  <div class="doc-section">
+    <h2>Latency &amp; Loss chart</h2>
+    <p>The core health chart. "Latency" is how long it takes for a signal to make a round trip --
+    think of it as a reaction-time measurement; lower is better, and spikes usually mean something's
+    straining the connection. "Loss" is the percentage of test signals that never made it back at
+    all -- a very blunt but reliable sign that the connection is actually broken, not just slow.
+    The chart's title tells you which of the two connections (main or backup) this data is
+    currently describing, since that can change if a switch happens.</p>
+  </div>
+
+  <div class="doc-section">
+    <h2>WAN Metrics (tabs per connection)</h2>
+    <p>Each tab is one physical internet connection, and shows two things together: how much data
+    is actually flowing through it (throughput) and its latency, as reported directly by the router
+    itself rather than measured indirectly. Useful because it can show you the <em>backup</em>
+    connection's health even while it's sitting idle and not currently in use -- something the main
+    chart above can't do. This data only refreshes about every 5 minutes on the router's own
+    schedule, which the dashboard tells you honestly rather than pretending it's instant.</p>
+  </div>
+
+  <div class="doc-section">
+    <h2>Degradation windows table + CSV download</h2>
+    <p>A detailed log: every stretch of bad connectivity, with exact start/end times, how long it
+    lasted, and how bad the latency and loss got during it. The download button exports this as a
+    spreadsheet-style file -- handy if you ever need to show an internet provider evidence of an
+    ongoing problem. Worth knowing: this is your own equipment's measurements, not an official or
+    certified reading, so it's useful as supporting evidence in a conversation, not as some kind of
+    legal proof.</p>
+  </div>
+
+  <div class="doc-section">
+    <h2>Speed Test</h2>
+    <p>Lets you manually trigger a real speed test on a specific connection and watch the result
+    come in live -- same idea as any online speed test site, just run through the router itself
+    and aimed at whichever connection you pick from the dropdown. Not every router model/firmware
+    actually supports this feature -- if yours doesn't, this section explains that plainly instead
+    of showing a button that would just fail.</p>
+  </div>
+
+  <div class="doc-section">
+    <h2>Configuration</h2>
+    <p>A separate page (linked above) for viewing and adjusting the underlying settings -- things
+    like which addresses get pinged, how sensitive the failover trigger is, connection
+    credentials, and the display names shown for each internet connection. Sensitive fields like
+    secret keys are hidden by default with a toggle to reveal them. After saving, the
+    "Apply &amp; Restart" button puts changes into effect automatically -- the dashboard goes away
+    for roughly 10-30 seconds and comes back on its own, with monitoring resuming automatically.
+    The two connection display names are the exception: those apply immediately on the next
+    refresh, no restart needed.</p>
+  </div>
+
+  <div class="doc-section">
+    <h2>Danger Zone (this page and Configuration)</h2>
+    <p>Each page with a Danger Zone requires typing a confirmation word before anything happens,
+    since these actions are deliberately hard to trigger by accident. On the main dashboard, it
+    permanently erases historical charts and logs (but not which connection is currently active).
+    On the Configuration page, it reverts every setting back to its original configured/default
+    value (but doesn't touch the historical data).</p>
+  </div>
+</body>
+</html>
