@@ -17,8 +17,10 @@ import sqlite3
 import time
 from contextlib import contextmanager
 
-DB_PATH = os.environ.get("DB_PATH", "/data/wan-monitor.db")
-RETENTION_DAYS = float(os.environ.get("RETENTION_DAYS", "90"))
+from config import get_config
+
+DB_PATH = get_config("DB_PATH")
+RETENTION_DAYS = get_config("RETENTION_DAYS")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS cycles (
@@ -125,6 +127,21 @@ def init_db():
         if inf_ids:
             conn.executemany("UPDATE cycles SET avg_latency_ms = NULL WHERE id = ?", [(i,) for i in inf_ids])
 
+        # Same data migration, same reasoning, for events.trigger_latency_ms
+        # -- a second, separate spot the Infinity bug leaked into (a real
+        # automatic failover calls insert_event() with the triggering
+        # cycle's avg_latency_ms, which is very often Infinity, since 100%
+        # loss is frequently what caused the trigger in the first place).
+        event_rows = conn.execute(
+            "SELECT id, trigger_latency_ms FROM events WHERE trigger_latency_ms IS NOT NULL"
+        ).fetchall()
+        event_inf_ids = [row[0] for row in event_rows if row[1] == float("inf")]
+        if event_inf_ids:
+            conn.executemany(
+                "UPDATE events SET trigger_latency_ms = NULL WHERE id = ?",
+                [(i,) for i in event_inf_ids],
+            )
+
         # Migration: monitor_state existed before primary_healthy_since was
         # added. CREATE TABLE IF NOT EXISTS won't add columns to an already-
         # existing table, so add it explicitly if missing.
@@ -150,6 +167,14 @@ def insert_cycle(ts: float, avg_latency_ms: float, loss_pct: float, is_bad: bool
 
 
 def insert_event(ts: float, action: str, dry_run: bool, trigger_latency_ms=None, trigger_loss_pct=None, consecutive_cycles=None):
+    # Same class of bug as insert_cycle()'s avg_latency_ms fix: a failover
+    # trigger event is called with result.avg_latency_ms at the exact
+    # moment the trigger fires -- which is very often when that cycle had
+    # 100% loss (avg_latency_ms == inf), since that's frequently what
+    # caused the trigger in the first place. Infinity isn't valid JSON and
+    # would silently break /api/events the same way it broke /api/cycles.
+    if trigger_latency_ms == float("inf"):
+        trigger_latency_ms = None
     with _connect() as conn:
         conn.execute(
             "INSERT INTO events (ts, action, dry_run, trigger_latency_ms, trigger_loss_pct, consecutive_cycles) "

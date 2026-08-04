@@ -142,6 +142,69 @@ expect an ISP to treat a self-hosted CSV as authoritative the way they'd
 treat their own NOC's monitoring. It's leverage for a conversation, not a
 legal instrument.
 
+### Pages: Dashboard / Configuration / Docs
+
+The web UI has three top-level pages, linked in a nav bar at the top of
+each: the main **Dashboard** (everything described above), **Configuration**,
+and **Docs** (a plain-language walkthrough of every dashboard section,
+aimed at someone non-technical -- useful for handing the URL to a client).
+
+**Configuration page** -- view and edit every setting from `.env` in the
+browser, grouped by section. How the precedence works:
+
+    value saved via this page  >  value in .env  >  built-in default
+
+Saved values live in a deliberately **separate** sqlite file
+(`/data/settings.db`) from the monitoring database, in the same shared
+volume both containers mount -- so a value saved here is visible to the
+monitor process too. Every field's placeholder shows the currently
+effective value and a badge shows where it's coming from (`database`,
+`env`, or `default`). Sensitive fields (the Omada client secret) render
+masked with an eye toggle to reveal.
+
+Field semantics: a field left **empty** on save is a no-op -- it keeps
+using whatever `.env`/default provides. Typing a value and saving creates
+a database override. To remove a single override later, the simplest path
+is currently the Danger Zone reset (removes all overrides); per-field
+un-override is possible via the API (`POST /api/config/save` with an empty
+string for that key) but has no dedicated UI button yet.
+
+**Applying changes -- the Apply & Restart button.** Both processes read
+config once at startup, so changes need a restart to take effect -- but
+the managing user never touches docker: the Configuration page's
+**Apply & Restart** button restarts both services automatically. How it
+works under the hood: the dashboard writes a timestamp flag into the
+shared settings db and exits itself just after the HTTP response flushes;
+`monitor.py` checks that flag once per cycle and exits cleanly when it
+sees one newer than its own start time; Docker's `restart: unless-stopped`
+policy brings both containers back with fresh config. Worst-case monitor
+latency is one `CHECK_INTERVAL_SECONDS` (~5s); the dashboard is typically
+back within 10-30 seconds and the page reconnects and reloads itself.
+No Docker socket is mounted anywhere -- the signal travels through the
+shared volume, which is a far smaller security surface than letting the
+web container drive the Docker API.
+
+**Exception -- WAN display labels apply live.** `WAN_PRIMARY_LABEL` /
+`WAN_BACKUP_LABEL` (Configuration > WAN Ports) replace the router-reported
+port names ("WAN", "WAN/LAN1") everywhere the dashboard shows them: the
+active-WAN badge, failover button and confirm dialog, chart title, WAN
+Metrics tabs, and the speed-test dropdown. These resolve at request time
+rather than startup, so they take effect on the next poll (~15s) with no
+restart -- safe to do live since they're purely cosmetic. Blank label =
+router-reported name passes through unchanged.
+
+The fallback, if the button is ever unavailable, remains:
+
+```bash
+docker compose up -d --force-recreate
+```
+
+**Configuration Danger Zone** -- deletes every saved override (the whole
+settings database), reverting all settings to `.env`/defaults. Gated
+behind typing `RESET`. Does not touch `.env` itself or the monitoring
+database -- completely independent from the main Dashboard's truncate
+button, which does the opposite (clears history, leaves settings alone).
+
 ## Setup
 
 Everything below has been confirmed working end-to-end against a real
@@ -461,7 +524,25 @@ untestable this way) if the container restarts while genuinely failed over.
 - `db.py` -- shared SQLite persistence: cycles, events, degradation-window
   aggregation, persisted `monitor_state` (survives restarts), and
   `truncate_history()` for the dashboard's Danger Zone.
-- `dashboard.py` -- Flask app serving the full web UI described above.
+- `config.py` -- the SETTINGS_REGISTRY (single source of truth for every
+  tunable: default, type, sensitivity, description) and `get_config()`, the
+  precedence-aware resolver (settings.db > .env > default) that both
+  `monitor.py` and `dashboard.py` now read all config through.
+- `settings_store.py` -- the separate `/data/settings.db` sqlite file
+  behind the Configuration page's saved overrides. Self-initializing on
+  every connection, so import order between modules can't break it.
+- `templates/` -- the three HTML pages (`dashboard.html`,
+  `configuration.html`, `docs.html`), served via Flask's native Jinja2
+  template loader. These deliberately live in real `.html` files rather
+  than Python string constants: embedding them in Python added a second
+  escaping layer (JS needs `\\n`, so the Python source had to carry
+  `\\\\n`), which produced a nasty bug class -- a missing backslash serves
+  syntactically broken JavaScript while `py_compile` and checksums all
+  pass, since the Python itself stays valid. As plain files there is one
+  escaping layer and the served `<script>` blocks are Node-parseable
+  as-is (which is now part of the test methodology).
+- `dashboard.py` -- Flask app: all routes/API endpoints for the web UI
+  described above (markup lives in `templates/`).
 - `get_site_id.sh` -- standalone script to look up your `OMADA_SITE_ID`.
 - `get_wan_ports_config.sh` -- standalone script to call any Open API GET
   endpoint by path (with query string support), used throughout this
@@ -489,11 +570,13 @@ docker compose up -d --build
 `-d` runs detached (background). Both containers start; dashboard is at
 `http://<host>:8090`.
 
-**After editing `.env`** (any variable) -- env vars are only read once at
-process start, so the running container has no way to know the file
-changed. `docker compose restart` does NOT reload `.env` either -- it
-restarts the existing container without re-reading it. You need to
-recreate:
+**After saving changes on the Configuration page** -- click the page's
+**Apply & Restart** button; no docker commands needed (see "Applying
+changes" in the Dashboard section for how it works). The commands below
+are the manual fallback, and what you need after editing `.env` directly
+on the host (config is only read once at process start, and `docker
+compose restart` does NOT reload `.env` -- it restarts the existing
+container without re-reading it; you need to recreate):
 ```bash
 docker compose up -d --force-recreate wan-failover-monitor
 # and/or, if the change affects the dashboard (e.g. OMADA_* vars, DASHBOARD_*):

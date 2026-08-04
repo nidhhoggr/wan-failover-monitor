@@ -19,7 +19,6 @@ State machine, per check cycle:
 """
 
 import logging
-import os
 import re
 import statistics
 import subprocess
@@ -30,25 +29,25 @@ from dataclasses import dataclass
 
 from omada_client import OmadaClient, OmadaAuthError
 import db
+import settings_store
+from config import get_config
 
-# ---- config -----------------------------------------------------------
+# ---- config -------------------------------------------------------------
+# Every value below is resolved through config.get_config(), which checks
+# settings.db (saved via the dashboard's Configuration tab) first, then
+# .env, then the hardcoded default in config.py's SETTINGS_REGISTRY --
+# that registry is now the single source of truth for defaults, replacing
+# the os.environ.get(..., "default") calls that used to live here directly.
+# See config.py's module docstring for why a saved Configuration change
+# still needs a container restart to actually take effect.
 
-def env_bool(name: str, default: bool) -> bool:
-    val = os.environ.get(name)
-    if val is None:
-        return default
-    return val.strip().lower() in ("1", "true", "yes", "on")
+settings_store.init_settings_db()
 
-
-def env_list(name: str, default: str) -> list:
-    return [x.strip() for x in os.environ.get(name, default).split(",") if x.strip()]
-
-
-PING_TARGETS = env_list("PING_TARGETS", "1.1.1.1,8.8.8.8,9.9.9.9")
-LATENCY_THRESHOLD_MS = float(os.environ.get("LATENCY_THRESHOLD_MS", "150"))
-PACKET_LOSS_THRESHOLD_PCT = float(os.environ.get("PACKET_LOSS_THRESHOLD_PCT", "15"))
-CONSECUTIVE_BAD_TO_TRIGGER = int(os.environ.get("CONSECUTIVE_BAD_TO_TRIGGER", "12"))
-CONSECUTIVE_GOOD_TO_FAILBACK = int(os.environ.get("CONSECUTIVE_GOOD_TO_FAILBACK", "24"))
+PING_TARGETS = [t.strip() for t in get_config("PING_TARGETS").split(",") if t.strip()]
+LATENCY_THRESHOLD_MS = get_config("LATENCY_THRESHOLD_MS")
+PACKET_LOSS_THRESHOLD_PCT = get_config("PACKET_LOSS_THRESHOLD_PCT")
+CONSECUTIVE_BAD_TO_TRIGGER = get_config("CONSECUTIVE_BAD_TO_TRIGGER")
+CONSECUTIVE_GOOD_TO_FAILBACK = get_config("CONSECUTIVE_GOOD_TO_FAILBACK")
 # IMPORTANT: once failed over, subsequent good cycles reflect the health of
 # whichever WAN is now ACTIVE (the backup) -- not whether the original
 # primary has recovered. There is no way for this LAN-side monitor to tell
@@ -60,18 +59,18 @@ CONSECUTIVE_GOOD_TO_FAILBACK = int(os.environ.get("CONSECUTIVE_GOOD_TO_FAILBACK"
 # unrelated telemetry. Setting this true restores fully automatic
 # fail-back and accepts the real risk of flapping onto a still-broken
 # primary the moment the backup happens to look healthy for a while.
-AUTO_FAILBACK_ENABLED = env_bool("AUTO_FAILBACK_ENABLED", False)
+AUTO_FAILBACK_ENABLED = get_config("AUTO_FAILBACK_ENABLED")
 
 # How often to poll the primary WAN's real status via the Omada API (a
 # separate, lower-frequency cadence than CHECK_INTERVAL_SECONDS -- this is
 # an actual API call, not a local ping, so it shouldn't run every cycle).
-PRIMARY_HEALTH_POLL_INTERVAL_SECONDS = float(os.environ.get("PRIMARY_HEALTH_POLL_INTERVAL_SECONDS", "30"))
+PRIMARY_HEALTH_POLL_INTERVAL_SECONDS = get_config("PRIMARY_HEALTH_POLL_INTERVAL_SECONDS")
 
 # Once the primary is reported healthy via the API, require it to stay
 # continuously healthy for this long before fail-back is even considered.
 # Any single unhealthy poll during this window resets the clock to zero.
 # Default 300s (5 min) -- deliberately conservative.
-PRIMARY_HEALTHY_STABILITY_SECONDS = float(os.environ.get("PRIMARY_HEALTHY_STABILITY_SECONDS", "300"))
+PRIMARY_HEALTHY_STABILITY_SECONDS = get_config("PRIMARY_HEALTHY_STABILITY_SECONDS")
 
 # "Healthy" for fail-back purposes requires internetState==1 (the router's
 # own connectivity flag) AND latency/loss from that same wan-status
@@ -81,8 +80,8 @@ PRIMARY_HEALTHY_STABILITY_SECONDS = float(os.environ.get("PRIMARY_HEALTHY_STABIL
 # values come from the router's own probe, not this monitor's LAN-side
 # pings, and you may reasonably want a different tolerance for "good enough
 # to trust as primary again" than for "bad enough to fail off of."
-PRIMARY_HEALTHY_LATENCY_THRESHOLD_MS = float(os.environ.get("PRIMARY_HEALTHY_LATENCY_THRESHOLD_MS", "100"))
-PRIMARY_HEALTHY_LOSS_THRESHOLD_PCT = float(os.environ.get("PRIMARY_HEALTHY_LOSS_THRESHOLD_PCT", "5"))
+PRIMARY_HEALTHY_LATENCY_THRESHOLD_MS = get_config("PRIMARY_HEALTHY_LATENCY_THRESHOLD_MS")
+PRIMARY_HEALTHY_LOSS_THRESHOLD_PCT = get_config("PRIMARY_HEALTHY_LOSS_THRESHOLD_PCT")
 # A single cycle going the "wrong" direction (e.g. one bad cycle during an
 # otherwise-clean good streak) doesn't immediately zero the streak -- it
 # takes this many CONSECUTIVE opposite-direction cycles to actually break
@@ -90,31 +89,31 @@ PRIMARY_HEALTHY_LOSS_THRESHOLD_PCT = float(os.environ.get("PRIMARY_HEALTHY_LOSS_
 # reasonable default: absorbs isolated single-cycle noise (one dropped ping
 # to one of several targets) without absorbing anything that looks like a
 # real, sustained change in conditions.
-STREAK_TOLERANCE_CYCLES = int(os.environ.get("STREAK_TOLERANCE_CYCLES", "2"))
-COOLDOWN_SECONDS = float(os.environ.get("COOLDOWN_SECONDS", "120"))
-CHECK_INTERVAL_SECONDS = float(os.environ.get("CHECK_INTERVAL_SECONDS", "5"))
-PING_COUNT_PER_CYCLE = int(os.environ.get("PING_COUNT_PER_CYCLE", "3"))
-PING_TIMEOUT_SECONDS = float(os.environ.get("PING_TIMEOUT_SECONDS", "2"))
+STREAK_TOLERANCE_CYCLES = get_config("STREAK_TOLERANCE_CYCLES")
+COOLDOWN_SECONDS = get_config("COOLDOWN_SECONDS")
+CHECK_INTERVAL_SECONDS = get_config("CHECK_INTERVAL_SECONDS")
+PING_COUNT_PER_CYCLE = get_config("PING_COUNT_PER_CYCLE")
+PING_TIMEOUT_SECONDS = get_config("PING_TIMEOUT_SECONDS")
 
-ENABLE_THROUGHPUT_CHECK = env_bool("ENABLE_THROUGHPUT_CHECK", False)
-THROUGHPUT_CHECK_EVERY_N_CYCLES = int(os.environ.get("THROUGHPUT_CHECK_EVERY_N_CYCLES", "60"))
-THROUGHPUT_TEST_URL = os.environ.get("THROUGHPUT_TEST_URL", "https://speed.cloudflare.com/__down?bytes=2000000")
-THROUGHPUT_MIN_MBPS = float(os.environ.get("THROUGHPUT_MIN_MBPS", "5"))
+ENABLE_THROUGHPUT_CHECK = get_config("ENABLE_THROUGHPUT_CHECK")
+THROUGHPUT_CHECK_EVERY_N_CYCLES = get_config("THROUGHPUT_CHECK_EVERY_N_CYCLES")
+THROUGHPUT_TEST_URL = get_config("THROUGHPUT_TEST_URL")
+THROUGHPUT_MIN_MBPS = get_config("THROUGHPUT_MIN_MBPS")
 
-DRY_RUN = env_bool("DRY_RUN", True)
+DRY_RUN = get_config("DRY_RUN")
 
-OMADA_BASE_URL = os.environ.get("OMADA_BASE_URL", "")
-OMADA_CLIENT_ID = os.environ.get("OMADA_CLIENT_ID", "")
-OMADA_CLIENT_SECRET = os.environ.get("OMADA_CLIENT_SECRET", "")
-OMADA_OMADAC_ID = os.environ.get("OMADA_OMADAC_ID", "")
-OMADA_SITE_ID = os.environ.get("OMADA_SITE_ID", "")
-OMADA_GATEWAY_MAC = os.environ.get("OMADA_GATEWAY_MAC", "")
-OMADA_VERIFY_TLS = env_bool("OMADA_VERIFY_TLS", False)
+OMADA_BASE_URL = get_config("OMADA_BASE_URL")
+OMADA_CLIENT_ID = get_config("OMADA_CLIENT_ID")
+OMADA_CLIENT_SECRET = get_config("OMADA_CLIENT_SECRET")
+OMADA_OMADAC_ID = get_config("OMADA_OMADAC_ID")
+OMADA_SITE_ID = get_config("OMADA_SITE_ID")
+OMADA_GATEWAY_MAC = get_config("OMADA_GATEWAY_MAC")
+OMADA_VERIFY_TLS = get_config("OMADA_VERIFY_TLS")
 
-WAN_PRIMARY_PORT_ID = os.environ.get("WAN_PRIMARY_PORT_ID", "")
-WAN_BACKUP_PORT_ID = os.environ.get("WAN_BACKUP_PORT_ID", "")
+WAN_PRIMARY_PORT_ID = get_config("WAN_PRIMARY_PORT_ID")
+WAN_BACKUP_PORT_ID = get_config("WAN_BACKUP_PORT_ID")
 
-LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
+LOG_LEVEL = get_config("LOG_LEVEL")
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -348,8 +347,22 @@ def main():
     cycle_count = 0
     last_prune_time = 0.0
     last_health_poll_time = 0.0
+    process_start_time = time.time()
 
     while True:
+        # Dashboard's "Apply & Restart" button writes a timestamp flag into
+        # the shared settings db; exiting cleanly here lets Docker's
+        # `restart: unless-stopped` policy bring this container back with
+        # fresh config -- the mechanism that makes configuration changes
+        # apply without the user ever touching docker commands. Checked
+        # once per cycle, so worst-case signal latency is one
+        # CHECK_INTERVAL_SECONDS. monitor_state (failed_over etc.) is
+        # already persisted at every change, so a clean exit loses nothing.
+        if settings_store.restart_requested_since(process_start_time):
+            log.info("restart requested via dashboard Configuration page -- "
+                     "exiting so Docker restarts this container with fresh settings")
+            sys.exit(0)
+
         cycle_count += 1
         result = run_cycle()
 

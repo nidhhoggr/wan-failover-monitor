@@ -14,7 +14,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY omada_client.py monitor.py db.py dashboard.py ./
+COPY omada_client.py monitor.py db.py dashboard.py config.py settings_store.py ./
+COPY templates/ ./templates/
 
 # Run as non-root where possible. NOTE: raw ICMP via the `ping` binary needs
 # either root or the CAP_NET_RAW capability. We shell out to the setuid/setcap

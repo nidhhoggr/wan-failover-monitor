@@ -13,26 +13,30 @@ step, no separate frontend container.
 
 import csv
 import io
+import itertools
 import logging
 import os
 import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from flask import Flask, Response, jsonify, render_template_string, request
+from flask import Flask, Response, jsonify, render_template, request
 
 import db
+import settings_store
+from config import get_config, list_settings_for_ui, SETTINGS_REGISTRY
 from omada_client import OmadaClient
 
 log = logging.getLogger("dashboard")
 
 app = Flask(__name__)
+settings_store.init_settings_db()
 
 # Lazily built, module-level, reused across requests -- only needed for the
 # alerts panel (everything else on this dashboard reads the local sqlite db
 # monitor.py writes, not the Omada API directly). Built lazily rather than
-# at import time so a missing/misconfigured OMADA_* env var disables just
-# the alerts panel with a clear message, instead of crashing the whole
+# at import time so missing/misconfigured Omada settings disable just the
+# alerts panel with a clear message, instead of crashing the whole
 # dashboard on startup.
 _omada_client = None
 _omada_client_error = None
@@ -41,8 +45,23 @@ _omada_client_error = None
 def get_omada_client():
     global _omada_client, _omada_client_error
     if _omada_client is None and _omada_client_error is None:
+        missing = [
+            k for k in ("OMADA_BASE_URL", "OMADA_CLIENT_ID", "OMADA_CLIENT_SECRET", "OMADA_OMADAC_ID", "OMADA_SITE_ID")
+            if not get_config(k)
+        ]
+        if missing:
+            _omada_client_error = f"Missing required Omada config: {', '.join(missing)}"
+            log.warning("Alerts panel disabled: %s", _omada_client_error)
+            return None
         try:
-            _omada_client = OmadaClient.from_env()
+            _omada_client = OmadaClient(
+                base_url=get_config("OMADA_BASE_URL"),
+                client_id=get_config("OMADA_CLIENT_ID"),
+                client_secret=get_config("OMADA_CLIENT_SECRET"),
+                omadac_id=get_config("OMADA_OMADAC_ID"),
+                site_id=get_config("OMADA_SITE_ID"),
+                verify_tls=get_config("OMADA_VERIFY_TLS"),
+            )
         except Exception as e:
             _omada_client_error = str(e)
             log.warning("Alerts panel disabled: %s", e)
@@ -52,11 +71,11 @@ def get_omada_client():
 # timestamps looked like GMT regardless of where you are) -- explicit
 # IANA zone name so it's correct and DST-aware regardless of container TZ
 # config. America/Los_Angeles covers PST/PDT automatically.
-DASHBOARD_TIMEZONE = os.environ.get("DASHBOARD_TIMEZONE", "America/Los_Angeles")
+DASHBOARD_TIMEZONE = get_config("DASHBOARD_TIMEZONE")
 _TZ = ZoneInfo(DASHBOARD_TIMEZONE)
 
-REFRESH_INTERVAL_SECONDS = int(os.environ.get("DASHBOARD_REFRESH_INTERVAL_SECONDS", "15"))
-ISP_LOAD_REFRESH_INTERVAL_SECONDS = int(os.environ.get("DASHBOARD_ISP_LOAD_POLL_INTERVAL_SECONDS", "60"))
+REFRESH_INTERVAL_SECONDS = get_config("DASHBOARD_REFRESH_INTERVAL_SECONDS")
+ISP_LOAD_REFRESH_INTERVAL_SECONDS = get_config("DASHBOARD_ISP_LOAD_POLL_INTERVAL_SECONDS")
 
 RANGE_OPTIONS = {
     "6h": 6 * 3600,
@@ -66,854 +85,54 @@ RANGE_OPTIONS = {
     "90d": 90 * 86400,
 }
 
-PAGE = """
-<!doctype html>
-<html>
-<head>
-  <script>
-    // Set the theme attribute before the stylesheet paints anything, to
-    // avoid a flash of the wrong theme on load. Defaults to the OS-level
-    // preference if nothing's been chosen here before; otherwise honors
-    // whatever was last picked, persisted across visits.
-    (function () {
-      var saved = localStorage.getItem('wan-monitor-theme');
-      var theme = saved || (window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
-      document.documentElement.setAttribute('data-theme', theme);
-    })();
-  </script>
-  <meta charset="utf-8">
-  <title>WAN Failover Monitor</title>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
-  <style>
-    :root {
-      --bg-page: #0f1115;
-      --bg-card: #14161c;
-      --bg-card-alt: #1a1d24;
-      --bg-card-active: #2b2f38;
-      --border-color: #2a2d35;
-      --border-color-strong: #333;
-      --text-primary: #e6e6e6;
-      --text-secondary: #999;
-      --text-muted: #888;
-      --accent-link: #8ab4f8;
-      --accent-blue: #4a90e2;
-      --accent-blue-strong: #2b6cb0;
-      --accent-green: #3ecf6e;
-      --accent-green-bg: #1c3a24;
-      --accent-red: #d64545;
-      --accent-red-soft: #f28b82;
-      --accent-red-strong: #a33;
-      --accent-red-strong-hover: #c44;
-      --accent-red-badge-bg: #5c1e1e;
-      --accent-red-badge-text: #ffb3b3;
-      --accent-orange-bg: #3a2a12;
-      --accent-orange-text: #f0b155;
-      --btn-disabled-bg: #444;
-      --chart-grid: #222;
-      --chart-tick: #999;
-      --chart-legend: #ccc;
-    }
-    [data-theme="light"] {
-      --bg-page: #f5f6f8;
-      --bg-card: #ffffff;
-      --bg-card-alt: #eef0f3;
-      --bg-card-active: #dde3ea;
-      --border-color: #d8dce2;
-      --border-color-strong: #c5cad2;
-      --text-primary: #1a1d24;
-      --text-secondary: #5b6270;
-      --text-muted: #757c8a;
-      --accent-link: #2b6cb0;
-      --accent-blue: #2b6cb0;
-      --accent-blue-strong: #2b6cb0;
-      --accent-green: #1f9950;
-      --accent-green-bg: #dff3e6;
-      --accent-red: #c53030;
-      --accent-red-soft: #c53030;
-      --accent-red-strong: #c53030;
-      --accent-red-strong-hover: #a82424;
-      --accent-red-badge-bg: #fbdada;
-      --accent-red-badge-text: #a82424;
-      --accent-orange-bg: #fdf0da;
-      --accent-orange-text: #9a6a12;
-      --btn-disabled-bg: #ccc;
-      --chart-grid: #e3e6ea;
-      --chart-tick: #5b6270;
-      --chart-legend: #333;
-    }
-    body { font-family: -apple-system, Helvetica, Arial, sans-serif; margin: 2rem;
-           background: var(--bg-page); color: var(--text-primary); }
-    h1 { font-size: 1.3rem; display: inline-block; margin-right: 1rem; }
-    .controls { margin-bottom: 1rem; display: flex; align-items: center; flex-wrap: wrap; gap: 1rem; }
-    .controls a { color: var(--accent-link); margin-right: 1rem; text-decoration: none; }
-    .controls a.active { font-weight: bold; text-decoration: underline; }
-    table { border-collapse: collapse; width: 100%; margin-top: 1.5rem; font-size: 0.85rem; }
-    th, td { border: 1px solid var(--border-color-strong); padding: 0.4rem 0.6rem; text-align: right; }
-    th { background: var(--bg-card-alt); }
-    td:first-child, th:first-child { text-align: left; }
-    canvas { background: var(--bg-card); border-radius: 6px; padding: 1rem; }
-    .export { margin-top: 1rem; display: inline-block; background: var(--accent-blue-strong); color: white;
-              padding: 0.5rem 1rem; border-radius: 4px; text-decoration: none; font-size: 0.85rem; }
-    .stat { display: inline-block; margin-right: 2rem; }
-    .stat b { font-size: 1.4rem; display: block; }
-    #theme-toggle-btn { background: var(--bg-card-alt); color: var(--text-primary); border: 1px solid var(--border-color-strong);
-                         border-radius: 4px; padding: 0.4rem 0.8rem; cursor: pointer; font-size: 0.85rem; }
-    #live-toggle-btn { background: var(--bg-card-alt); color: var(--text-primary); border: 1px solid var(--border-color-strong);
-                        border-radius: 4px; padding: 0.4rem 0.8rem; cursor: pointer; font-size: 0.85rem; }
-    #live-toggle-btn.live { border-color: var(--accent-green); color: var(--accent-green); }
-    #live-toggle-btn.paused { border-color: var(--text-secondary); color: var(--text-secondary); }
-    #live-indicator { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 0.4rem; }
-    #live-indicator.live { background: var(--accent-green); }
-    #live-indicator.paused { background: var(--text-secondary); }
-    #last-updated { color: var(--text-muted); font-size: 0.8rem; }
-    .count-badge { background: var(--accent-red-badge-bg); color: var(--accent-red-badge-text); border-radius: 10px;
-                   padding: 0.05rem 0.5rem; font-size: 0.75rem; vertical-align: middle; }
-    .alert-item { display: flex; align-items: center; gap: 0.75rem; background: var(--bg-card);
-                  border: 1px solid var(--border-color); border-radius: 6px; padding: 0.6rem 0.9rem; margin-bottom: 0.5rem; }
-    .alert-level { font-size: 0.7rem; text-transform: uppercase; padding: 0.15rem 0.5rem; border-radius: 3px;
-                    background: var(--accent-orange-bg); color: var(--accent-orange-text); white-space: nowrap; }
-    .alert-content { flex: 1; font-size: 0.85rem; }
-    .alert-time { color: var(--text-muted); font-size: 0.78rem; white-space: nowrap; }
-    .alert-ack-btn { background: transparent; border: 1px solid var(--border-color-strong); color: var(--text-secondary);
-                      border-radius: 4px; padding: 0.25rem 0.6rem; font-size: 0.75rem; cursor: pointer; white-space: nowrap; }
-    .alert-ack-btn:hover:not(:disabled) { border-color: var(--accent-green); color: var(--accent-green); }
-    .alert-ack-btn:disabled { cursor: default; opacity: 0.6; }
-    .alerts-empty { color: var(--text-muted); font-size: 0.85rem; padding: 0.5rem 0; }
-    .alerts-error { color: var(--accent-red-soft); font-size: 0.85rem; padding: 0.5rem 0; }
-    .wan-metrics-tabs { margin-bottom: 0.75rem; }
-    .tab-btn { background: var(--bg-card-alt); color: var(--text-secondary); border: 1px solid var(--border-color-strong);
-               padding: 0.4rem 0.9rem; font-size: 0.85rem; cursor: pointer; }
-    .tab-btn:first-child { border-radius: 4px 0 0 4px; }
-    .tab-btn:last-child { border-radius: 0 4px 4px 0; border-left: none; }
-    .tab-btn.active { background: var(--bg-card-active); color: var(--text-primary); font-weight: bold; }
-    .speedtest-controls { display: flex; align-items: center; gap: 0.75rem; margin-bottom: 0.75rem; }
-    .speedtest-controls select { background: var(--bg-card-alt); color: var(--text-primary); border: 1px solid var(--border-color-strong);
-                                  border-radius: 4px; padding: 0.4rem 0.6rem; font-size: 0.85rem; }
-    #speedtest-start-btn { background: var(--accent-blue-strong); color: white; border: none; border-radius: 4px;
-                            padding: 0.5rem 1rem; font-size: 0.85rem; cursor: pointer; }
-    #speedtest-start-btn:disabled { background: var(--btn-disabled-bg); cursor: default; opacity: 0.7; }
-    #speedtest-result { background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 6px;
-                         padding: 0.9rem; font-size: 0.85rem; min-height: 1.5rem; }
-    .speedtest-metric { display: inline-block; margin-right: 2rem; }
-    .speedtest-metric b { font-size: 1.2rem; display: block; }
-    .speedtest-progress-bar { background: var(--border-color); border-radius: 4px; height: 6px; margin-top: 0.6rem; overflow: hidden; }
-    .speedtest-progress-fill { background: var(--accent-blue); height: 100%; transition: width 0.3s; }
-    .active-wan-panel { display: flex; align-items: center; gap: 1rem; background: var(--bg-card);
-                         border: 1px solid var(--border-color); border-radius: 6px; padding: 0.7rem 1rem; margin-bottom: 1rem; }
-    .active-wan-panel .wan-badge { background: var(--accent-green-bg); color: var(--accent-green); border-radius: 4px;
-                                    padding: 0.2rem 0.6rem; font-weight: bold; font-size: 0.85rem; }
-    #failover-btn { background: var(--accent-red-strong); color: white; border: none; border-radius: 4px;
-                     padding: 0.5rem 1rem; font-size: 0.85rem; cursor: pointer; margin-left: auto; }
-    #failover-btn:hover:not(:disabled) { background: var(--accent-red-strong-hover); }
-    #failover-btn:disabled { background: var(--btn-disabled-bg); cursor: default; opacity: 0.7; }
-    .danger-zone { margin-top: 3rem; padding: 1rem; border: 1px dashed var(--accent-red-soft);
-                    border-radius: 6px; background: color-mix(in srgb, var(--accent-red-soft) 6%, transparent); }
-    #truncate-db-btn { background: transparent; color: var(--accent-red-soft); border: 1px solid var(--accent-red-soft);
-                        border-radius: 4px; padding: 0.5rem 1rem; font-size: 0.85rem; cursor: pointer; }
-    #truncate-db-btn:hover:not(:disabled) { background: var(--accent-red-soft); color: white; }
-    #truncate-db-btn:disabled { opacity: 0.6; cursor: default; }
-  </style>
-</head>
-<body>
-  <h1>WAN Failover Monitor</h1>
-
-  <div class="controls">
-    <span>Range:
-    {% for key in ranges %}
-      <a href="/?range={{ key }}" class="{{ 'active' if key == selected_range else '' }}">{{ key }}</a>
-    {% endfor %}
-    </span>
-    <button id="live-toggle-btn" class="live" onclick="toggleLive()">
-      <span id="live-indicator" class="live"></span><span id="live-toggle-label">Live</span>
-    </button>
-    <button id="theme-toggle-btn" onclick="toggleTheme()">
-      <span id="theme-toggle-label">Light mode</span>
-    </button>
-    <span id="last-updated"></span>
-  </div>
-
-  <div class="active-wan-panel">
-    <span>Active WAN: <span id="active-wan-name" class="wan-badge">--</span></span>
-    <span id="backup-wan-info" style="color:#888; font-size:0.85rem;"></span>
-    <button id="failover-btn" onclick="triggerFailover()" disabled>Switch WAN</button>
-  </div>
-
-  <div>
-    <div class="stat"><b id="stat-windows">--</b>degradation windows</div>
-    <div class="stat"><b id="stat-minutes">--</b>total degraded time</div>
-    <div class="stat"><b id="stat-events">--</b>failover actions</div>
-  </div>
-
-  <div id="alerts-panel">
-    <h2 style="font-size:1rem; margin: 1rem 0 0.5rem;">
-      Unresolved Alerts <span id="alerts-count-badge" class="count-badge"></span>
-    </h2>
-    <div id="alerts-list">Loading...</div>
-  </div>
-
-  <h2 id="ping-chart-title" style="font-size:1rem; margin: 1.5rem 0 0.5rem;">Latency &amp; Loss</h2>
-  <canvas id="chart" height="90"></canvas>
-
-  <h2 style="font-size:1rem; margin: 1.5rem 0 0.5rem;">
-    WAN Metrics (router-reported) <span id="wan-metrics-data-age" style="color:#888; font-size:0.78rem; font-weight:normal;"></span>
-  </h2>
-  <div class="wan-metrics-tabs" id="wan-metrics-tabs"></div>
-  <div id="wan-metrics-error" class="alerts-error" style="display:none;"></div>
-  <div id="wan-metrics-charts"></div>
-
-  <h2 style="font-size:1rem; margin: 1.5rem 0 0.5rem;">Speed Test</h2>
-  <div class="speedtest-controls">
-    <select id="speedtest-wan-select"><option>Loading WANs...</option></select>
-    <button id="speedtest-start-btn" onclick="startSpeedTest()">Start Speed Test</button>
-  </div>
-  <div id="speedtest-result"></div>
-
-  <a class="export" href="/report.csv?range={{ selected_range }}">Download ISP report (CSV)</a>
-
-  <table>
-    <thead>
-      <tr><th>Start</th><th>End</th><th>Duration</th><th>Avg latency</th><th>Peak latency</th><th>Avg loss</th><th>Peak loss</th></tr>
-    </thead>
-    <tbody id="windows-tbody">
-      <tr><td colspan="7">Loading...</td></tr>
-    </tbody>
-  </table>
-
-  <div class="danger-zone">
-    <h2 style="font-size:0.9rem; color: var(--accent-red-soft); margin: 0 0 0.5rem;">Danger Zone</h2>
-    <p style="color: var(--text-muted); font-size: 0.8rem; margin: 0 0 0.75rem;">
-      Permanently clears ping history, degradation windows, and failover event records
-      (chart, table, and CSV export data). Does NOT affect which WAN is currently active
-      or the monitor's operational state -- this only clears historical/reporting data.
-    </p>
-    <button id="truncate-db-btn" onclick="truncateDatabase()">Truncate Database</button>
-  </div>
-
-  <script>
-    const CURRENT_RANGE = {{ selected_range|tojson }};
-    const DASHBOARD_TZ = {{ dashboard_timezone|tojson }};
-    const REFRESH_MS = {{ refresh_interval_seconds }} * 1000;
-    const ISP_LOAD_REFRESH_MS = {{ isp_load_refresh_interval_seconds }} * 1000;
-
-    let chartInstance = null;
-    let wanPortChartInstances = {};  // keyed by portId -- built dynamically since port count/names come from the API
-    let wanPortTabsBuilt = false;
-    let activeWanPortTab = null;
-    let liveEnabled = true;
-    let pollTimer = null;
-    let wanMetricsPollTimer = null;
-
-    // Fixed color-by-metric-type within each port's chart (per your
-    // preference): blue for throughput, red for latency.
-    // Rate/latency colors are looked up live via themeColor() at chart-build
-    // time (see updateWanMetricsChart below) rather than cached here, since
-    // they need to reflect whichever theme is current after a toggle.
-
-    // Formats a unix timestamp in DASHBOARD_TZ as "YYYY-MM-DD HH:MM:SS" --
-    // explicit IANA zone via Intl, NOT the browser's local timezone, so the
-    // on-screen table always matches the CSV export regardless of where
-    // you're viewing this from.
-    function themeColor(varName) {
-      return getComputedStyle(document.documentElement).getPropertyValue(varName).trim();
-    }
-
-    function fmtTs(ts) {
-      const parts = new Intl.DateTimeFormat('en-US', {
-        timeZone: DASHBOARD_TZ, hour12: false,
-        year: 'numeric', month: '2-digit', day: '2-digit',
-        hour: '2-digit', minute: '2-digit', second: '2-digit',
-      }).formatToParts(new Date(ts * 1000));
-      const p = {};
-      parts.forEach(part => { p[part.type] = part.value; });
-      return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}:${p.second}`;
-    }
-
-    let currentActiveWan = null;
-    let currentBackupWan = null;
-    let failoverInFlight = false;
-
-    function renderActiveWan(resp) {
-      const nameEl = document.getElementById('active-wan-name');
-      const backupInfoEl = document.getElementById('backup-wan-info');
-      const btn = document.getElementById('failover-btn');
-      const chartTitle = document.getElementById('ping-chart-title');
-
-      if (resp.error || !resp.active) {
-        nameEl.textContent = 'unavailable';
-        backupInfoEl.textContent = resp.error ? escapeHtml(resp.error) : '';
-        btn.disabled = true;
-        if (chartTitle) chartTitle.textContent = 'Latency & Loss';
-        return;
-      }
-
-      currentActiveWan = resp.active;
-      currentBackupWan = resp.backup;
-      nameEl.textContent = resp.active.portName;
-      backupInfoEl.textContent = resp.backup ? `(backup: ${resp.backup.portName})` : '';
-      if (!failoverInFlight) {
-        btn.disabled = !resp.backup;
-        btn.textContent = resp.backup ? `Switch to ${resp.backup.portName}` : 'Switch WAN';
-      }
-      if (chartTitle) chartTitle.textContent = `Latency & Loss (reporting on: ${resp.active.portName})`;
-    }
-
-    function triggerFailover() {
-      if (!currentActiveWan || !currentBackupWan || failoverInFlight) return;
-
-      const confirmed = window.confirm(
-        `This will immediately move traffic from "${currentActiveWan.portName}" to "${currentBackupWan.portName}".\n\n` +
-        `This is a LIVE change to your network -- the same underlying action as running ` +
-        `./test_load_balance_swap.sh failover on the command line.\n\nAre you sure?`
-      );
-      if (!confirmed) return;
-
-      failoverInFlight = true;
-      const btn = document.getElementById('failover-btn');
-      btn.disabled = true;
-      btn.textContent = 'Switching...';
-
-      fetch('/api/failover', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ confirm: true }),
-      }).then(r => r.json()).then(data => {
-        failoverInFlight = false;
-        if (data.success) {
-          loadData();  // refresh everything -- badge, chart title, etc. should reflect the new state
-        } else {
-          alert('Failover failed: ' + data.error);
-          btn.disabled = false;
-          btn.textContent = currentBackupWan ? `Switch to ${currentBackupWan.portName}` : 'Switch WAN';
-        }
-      }).catch(err => {
-        failoverInFlight = false;
-        alert('Failover failed: ' + err);
-        btn.disabled = false;
-      });
-    }
-
-    function updateChart(cycles) {
-      const labels = cycles.map(d => fmtTs(d.ts));
-      const latency = cycles.map(d => d.avg_latency_ms);
-      const loss = cycles.map(d => d.loss_pct);
-
-      if (chartInstance === null) {
-        chartInstance = new Chart(document.getElementById('chart'), {
-          type: 'line',
-          data: {
-            labels: labels,
-            datasets: [
-              { label: 'Latency (ms)', data: latency, borderColor: themeColor('--accent-link'), yAxisID: 'y', pointRadius: 0, borderWidth: 1.5 },
-              { label: 'Loss (%)', data: loss, borderColor: themeColor('--accent-red-soft'), yAxisID: 'y1', pointRadius: 0, borderWidth: 1.5 },
-            ]
-          },
-          options: {
-            animation: false,
-            scales: {
-              x: { ticks: { maxTicksLimit: 8, color: themeColor('--chart-tick') }, grid: { color: themeColor('--chart-grid') } },
-              y: { type: 'linear', position: 'left', title: { display: true, text: 'ms' }, grid: { color: themeColor('--chart-grid') } },
-              y1: { type: 'linear', position: 'right', title: { display: true, text: '%' }, grid: { display: false } },
-            },
-            plugins: { legend: { labels: { color: themeColor('--chart-legend') } } }
-          }
-        });
-      } else {
-        chartInstance.data.labels = labels;
-        chartInstance.data.datasets[0].data = latency;
-        chartInstance.data.datasets[1].data = loss;
-        chartInstance.update('none');  // 'none' = no animation on refresh, avoids distracting flicker
-      }
-    }
-
-    function buildWanPortTabs(ports) {
-      const tabsContainer = document.getElementById('wan-metrics-tabs');
-      const chartsContainer = document.getElementById('wan-metrics-charts');
-      tabsContainer.innerHTML = '';
-      chartsContainer.innerHTML = '';
-      wanPortChartInstances = {};
-
-      ports.forEach((port, i) => {
-        const isActive = i === 0;
-        if (isActive) activeWanPortTab = port.portId;
-
-        const btn = document.createElement('button');
-        btn.className = 'tab-btn' + (isActive ? ' active' : '');
-        btn.textContent = port.portName;
-        btn.dataset.portId = port.portId;
-        btn.addEventListener('click', () => switchWanPortTab(port.portId));
-        tabsContainer.appendChild(btn);
-
-        const panel = document.createElement('div');
-        panel.id = `wan-port-panel-${port.portId}`;
-        panel.style.display = isActive ? 'block' : 'none';
-        const canvas = document.createElement('canvas');
-        canvas.id = `wan-port-canvas-${port.portId}`;
-        canvas.height = 90;
-        panel.appendChild(canvas);
-        chartsContainer.appendChild(panel);
-      });
-
-      wanPortTabsBuilt = true;
-    }
-
-    function switchWanPortTab(portId) {
-      activeWanPortTab = portId;
-      document.querySelectorAll('#wan-metrics-tabs .tab-btn').forEach(btn => {
-        // Compare as strings -- dataset values are always strings, portId from the API is a number.
-        btn.className = 'tab-btn' + (String(btn.dataset.portId) === String(portId) ? ' active' : '');
-      });
-      document.querySelectorAll('#wan-metrics-charts > div').forEach(panel => {
-        const panelPortId = panel.id.replace('wan-port-panel-', '');
-        panel.style.display = String(panelPortId) === String(portId) ? 'block' : 'none';
-      });
-      // Chart.js can under-size a chart that was created (or last updated)
-      // while its canvas was display:none -- force a resize now that it's
-      // visible again, on whichever chart was just switched to.
-      const chart = wanPortChartInstances[portId];
-      if (chart) chart.resize();
-    }
-
-    function updateWanMetricsChart(resp) {
-      const errorDiv = document.getElementById('wan-metrics-error');
-
-      if (resp.error) {
-        errorDiv.textContent = 'WAN metrics unavailable: ' + resp.error;
-        errorDiv.style.display = 'block';
-        document.getElementById('wan-metrics-tabs').style.display = 'none';
-        document.getElementById('wan-metrics-charts').style.display = 'none';
-        return;
-      }
-      errorDiv.style.display = 'none';
-      document.getElementById('wan-metrics-tabs').style.display = 'block';
-      document.getElementById('wan-metrics-charts').style.display = 'block';
-
-      const ports = resp.ports || [];
-      if (ports.length === 0) return;
-
-      // Honest freshness indicator: when the underlying DATA last changed,
-      // not when we last polled for it. This endpoint's data only updates
-      // roughly every 5 minutes server-side (confirmed via direct testing --
-      // identical responses 5s apart) -- our poll interval being shorter
-      // than that doesn't make the data any fresher, so say so explicitly
-      // rather than implying real-time updates that aren't actually happening.
-      const latestTimes = ports.map(p => p.data.length ? p.data[p.data.length - 1].time : 0);
-      const mostRecentTime = Math.max(...latestTimes, 0);
-      const ageEl = document.getElementById('wan-metrics-data-age');
-      if (ageEl && mostRecentTime > 0) {
-        const ageSeconds = Math.max(0, Math.floor(Date.now() / 1000) - mostRecentTime);
-        const ageMinutes = Math.floor(ageSeconds / 60);
-        ageEl.textContent = ageMinutes < 1
-          ? '(data as of: just now)'
-          : `(data as of: ${ageMinutes}m ago -- this endpoint updates roughly every 5min)`;
-      }
-
-      // Rebuild tabs/canvases only once, or if the actual set of ports
-      // changes (e.g. a port added/removed) -- not on every refresh, which
-      // would destroy and recreate chart instances unnecessarily and cause
-      // visible flicker on every live-poll tick.
-      const currentPortIds = ports.map(p => String(p.portId)).sort().join(',');
-      const builtPortIds = Object.keys(wanPortChartInstances).sort().join(',');
-      if (!wanPortTabsBuilt || (builtPortIds !== '' && currentPortIds !== builtPortIds)) {
-        buildWanPortTabs(ports);
-      }
-
-      ports.forEach(port => {
-        const labels = port.data.map(d => fmtTs(d.time));
-        const datasets = [
-          {
-            label: 'Throughput', data: port.data.map(d => d.totalRate),
-            borderColor: themeColor('--accent-blue'), yAxisID: 'y', pointRadius: 0, borderWidth: 1.5,
-          },
-          {
-            label: 'Latency', data: port.data.map(d => d.latency),
-            borderColor: themeColor('--accent-red'), yAxisID: 'y1', pointRadius: 0, borderWidth: 1.5,
-          },
-        ];
-
-        const existing = wanPortChartInstances[port.portId];
-        if (!existing) {
-          const canvas = document.getElementById(`wan-port-canvas-${port.portId}`);
-          if (!canvas) return;  // tab structure not built yet for this port -- next refresh will catch it
-          wanPortChartInstances[port.portId] = new Chart(canvas, {
-            type: 'line',
-            data: { labels: labels, datasets: datasets },
-            options: {
-              animation: false,
-              scales: {
-                x: { ticks: { maxTicksLimit: 8, color: themeColor('--chart-tick') }, grid: { color: themeColor('--chart-grid') } },
-                // Unit is provisional -- see get_isp_load()'s docstring in
-                // omada_client.py, not yet confirmed against a live response.
-                y: { type: 'linear', position: 'left', title: { display: true, text: 'KB/s (unconfirmed unit)' }, grid: { color: themeColor('--chart-grid') } },
-                y1: { type: 'linear', position: 'right', title: { display: true, text: 'ms' }, grid: { display: false } },
-              },
-              plugins: { legend: { labels: { color: themeColor('--chart-legend') } } }
-            }
-          });
-        } else {
-          existing.data.labels = labels;
-          existing.data.datasets = datasets;
-          existing.update('none');
-        }
-      });
-    }
-
-    function renderTable(windows) {
-      const tbody = document.getElementById('windows-tbody');
-      if (windows.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="7">No degradation windows in this range.</td></tr>';
-        return;
-      }
-      const rows = windows.slice().reverse().map(w => `
-        <tr>
-          <td>${fmtTs(w.start)}</td>
-          <td>${fmtTs(w.end)}</td>
-          <td>${w.duration_seconds.toFixed(0)}s</td>
-          <td>${w.avg_latency_ms !== null ? w.avg_latency_ms.toFixed(0) + ' ms' : '\u2014'}</td>
-          <td>${w.max_latency_ms !== null ? w.max_latency_ms.toFixed(0) + ' ms' : '\u2014'}</td>
-          <td>${w.avg_loss_pct.toFixed(1)}%</td>
-          <td>${w.max_loss_pct.toFixed(1)}%</td>
-        </tr>
-      `).join('');
-      tbody.innerHTML = rows;
-    }
-
-    function renderStats(windows, events) {
-      const totalBadMinutes = windows.reduce((sum, w) => sum + w.duration_seconds, 0) / 60.0;
-      document.getElementById('stat-windows').textContent = windows.length;
-      document.getElementById('stat-minutes').textContent = totalBadMinutes.toFixed(1) + ' min';
-      document.getElementById('stat-events').textContent = events.length;
-    }
-
-    function escapeHtml(s) {
-      const div = document.createElement('div');
-      div.textContent = s == null ? '' : String(s);
-      return div.innerHTML;
-    }
-
-    let speedTestPollTimer = null;
-    const SPEEDTEST_POLL_INTERVAL_MS = 2000;
-    const SPEEDTEST_TIMEOUT_MS = 90000;
-
-    function loadWanPortsForSpeedTest() {
-      fetch('/api/device-capabilities').then(r => r.json()).then(cap => {
-        if (cap.speedTestSupported === false) {
-          document.getElementById('speedtest-wan-select').outerHTML =
-            '<span style="color:#888;">Not available on this device</span>';
-          document.getElementById('speedtest-start-btn').style.display = 'none';
-          document.getElementById('speedtest-result').innerHTML =
-            'This gateway reports it does not support speed tests via the API (confirmed by a real rejection: "This device does not support speed test.").';
-          return;  // don't bother populating the port list, the feature can't work here regardless
-        }
-        // speedTestSupported === true, or null/unknown (e.g. credentials
-        // missing) -- in the unknown case, still offer the button; a real
-        // click will surface whatever the actual problem is via the normal
-        // error path, same as it did when this genuinely wasn't supported.
-        loadWanPortOptions();
-      }).catch(err => {
-        console.error('Failed to check device capabilities:', err);
-        loadWanPortOptions();  // fail open -- let a real attempt surface the actual error
-      });
-    }
-
-    function loadWanPortOptions() {
-      fetch('/api/wan-ports').then(r => r.json()).then(resp => {
-        const select = document.getElementById('speedtest-wan-select');
-        if (resp.error) {
-          select.innerHTML = `<option>Unavailable: ${escapeHtml(resp.error)}</option>`;
-          document.getElementById('speedtest-start-btn').disabled = true;
-          return;
-        }
-        if (resp.ports.length === 0) {
-          select.innerHTML = '<option>No WAN ports found</option>';
-          return;
-        }
-        select.innerHTML = resp.ports.map(p =>
-          `<option value="${escapeHtml(p.portId)}">${escapeHtml(p.portName)}</option>`
-        ).join('');
-      }).catch(err => {
-        console.error('Failed to load WAN ports for speed test:', err);
-        document.getElementById('speedtest-wan-select').innerHTML = '<option>Failed to load</option>';
-      });
-    }
-
-    function startSpeedTest() {
-      const select = document.getElementById('speedtest-wan-select');
-      const btn = document.getElementById('speedtest-start-btn');
-      const resultDiv = document.getElementById('speedtest-result');
-      const portUuid = select.value;
-      if (!portUuid) return;
-
-      select.disabled = true;
-      btn.disabled = true;
-      btn.textContent = 'Starting...';
-      resultDiv.innerHTML = 'Starting speed test...';
-
-      fetch('/api/speedtest/start', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ portUuid: portUuid }),
-      }).then(r => r.json()).then(data => {
-        if (!data.success) {
-          resultDiv.innerHTML = `<span style="color:#f28b82">Failed to start: ${escapeHtml(data.error)}</span>`;
-          select.disabled = false;
-          btn.disabled = false;
-          btn.textContent = 'Start Speed Test';
-          return;
-        }
-        btn.textContent = 'Running...';
-        // Port results are matched by the leading integer of the "1_hash"
-        // portId string (e.g. "1_8ff0..." -> port 1) -- same convention
-        // already used in monitor.py's check_primary_wan_health().
-        const portNum = parseInt(portUuid.split('_')[0], 10);
-        pollSpeedTestResult(portNum, Date.now());
-      }).catch(err => {
-        resultDiv.innerHTML = `<span style="color:#f28b82">Failed to start: ${escapeHtml(String(err))}</span>`;
-        select.disabled = false;
-        btn.disabled = false;
-        btn.textContent = 'Start Speed Test';
-      });
-    }
-
-    function pollSpeedTestResult(portNum, startedAt) {
-      if (speedTestPollTimer !== null) { clearTimeout(speedTestPollTimer); speedTestPollTimer = null; }
-
-      const select = document.getElementById('speedtest-wan-select');
-      const btn = document.getElementById('speedtest-start-btn');
-      const resultDiv = document.getElementById('speedtest-result');
-
-      if (Date.now() - startedAt > SPEEDTEST_TIMEOUT_MS) {
-        resultDiv.innerHTML = '<span style="color:#f28b82">Speed test timed out waiting for a result.</span>';
-        select.disabled = false;
-        btn.disabled = false;
-        btn.textContent = 'Start Speed Test';
-        return;
-      }
-
-      fetch('/api/speedtest/result').then(r => r.json()).then(data => {
-        if (data.error) {
-          resultDiv.innerHTML = `<span style="color:#f28b82">Error checking result: ${escapeHtml(data.error)}</span>`;
-          select.disabled = false;
-          btn.disabled = false;
-          btn.textContent = 'Start Speed Test';
-          return;
-        }
-
-        const results = (data.result && data.result.portSpeedResults) || [];
-        const portResult = results.find(r => r.portId === portNum);
-
-        if (!portResult) {
-          // No result for this port yet -- keep waiting.
-          resultDiv.innerHTML = 'Waiting for result...';
-          speedTestPollTimer = setTimeout(() => pollSpeedTestResult(portNum, startedAt), SPEEDTEST_POLL_INTERVAL_MS);
-          return;
-        }
-
-        const progress = portResult.progress || 0;
-        resultDiv.innerHTML = `
-          <div class="speedtest-metric"><b>${portResult.down ?? '--'}</b>Download (unit unconfirmed)</div>
-          <div class="speedtest-metric"><b>${portResult.up ?? '--'}</b>Upload (unit unconfirmed)</div>
-          <div class="speedtest-metric"><b>${portResult.latency ?? '--'} ms</b>Latency</div>
-          <div>${escapeHtml(portResult.serverName || '')} ${escapeHtml(portResult.serverLocation || '')}</div>
-          <div class="speedtest-progress-bar"><div class="speedtest-progress-fill" style="width:${Math.min(progress, 100)}%"></div></div>
-        `;
-
-        if (progress >= 100) {
-          select.disabled = false;
-          btn.disabled = false;
-          btn.textContent = 'Start Speed Test';
-        } else {
-          speedTestPollTimer = setTimeout(() => pollSpeedTestResult(portNum, startedAt), SPEEDTEST_POLL_INTERVAL_MS);
-        }
-      }).catch(err => {
-        resultDiv.innerHTML = `<span style="color:#f28b82">Error checking result: ${escapeHtml(String(err))}</span>`;
-        select.disabled = false;
-        btn.disabled = false;
-        btn.textContent = 'Start Speed Test';
-      });
-    }
-
-    function resolveAlert(id, btn) {
-      btn.disabled = true;
-      btn.textContent = 'Resolving...';
-      fetch('/api/alerts/resolve', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ id: id }),
-      }).then(r => r.json()).then(data => {
-        if (data.success) {
-          loadData();  // refresh everything -- this alert should drop out of the unresolved list
-        } else {
-          console.error('Failed to resolve alert:', data.error);
-          btn.disabled = false;
-          btn.textContent = 'Acknowledge';
-        }
-      }).catch(err => {
-        console.error('Failed to resolve alert:', err);
-        btn.disabled = false;
-        btn.textContent = 'Acknowledge';
-      });
-    }
-
-    function renderAlerts(alertsResp) {
-      const list = document.getElementById('alerts-list');
-      const badge = document.getElementById('alerts-count-badge');
-
-      if (alertsResp.error) {
-        badge.textContent = '';
-        list.innerHTML = `<div class="alerts-error">Alerts unavailable: ${escapeHtml(alertsResp.error)}</div>`;
-        return;
-      }
-
-      badge.textContent = alertsResp.unresolved_count !== null ? alertsResp.unresolved_count : '';
-
-      if (alertsResp.alerts.length === 0) {
-        list.innerHTML = '<div class="alerts-empty">No unresolved alerts.</div>';
-        return;
-      }
-
-      list.innerHTML = alertsResp.alerts.map(a => `
-        <div class="alert-item">
-          <span class="alert-level">${escapeHtml(a.level || a.module || '')}</span>
-          <span class="alert-content">${escapeHtml(a.content)}</span>
-          <span class="alert-time">${fmtTs(a.time / 1000)}</span>
-          <button class="alert-ack-btn" data-alert-id="${escapeHtml(a.id)}">Acknowledge</button>
-        </div>
-      `).join('');
-
-      list.querySelectorAll('.alert-ack-btn').forEach(btn => {
-        btn.addEventListener('click', () => resolveAlert(btn.dataset.alertId, btn));
-      });
-    }
-
-    function loadData() {
-      Promise.all([
-        fetch(`/api/cycles?range=${CURRENT_RANGE}`).then(r => r.json()),
-        fetch(`/api/windows?range=${CURRENT_RANGE}`).then(r => r.json()),
-        fetch(`/api/events?range=${CURRENT_RANGE}`).then(r => r.json()),
-        fetch(`/api/alerts`).then(r => r.json()),
-        fetch(`/api/active-wan`).then(r => r.json()),
-      ]).then(([cycles, windows, events, alerts, activeWan]) => {
-        updateChart(cycles);
-        renderTable(windows);
-        renderStats(windows, events);
-        renderAlerts(alerts);
-        renderActiveWan(activeWan);
-        document.getElementById('last-updated').textContent =
-          'Updated ' + new Date().toLocaleTimeString();
-      }).catch(err => {
-        console.error('Failed to load dashboard data:', err);
-        document.getElementById('last-updated').textContent = 'Update failed -- see console';
-      });
-    }
-
-    function loadWanMetrics() {
-      fetch(`/api/isp-load?range=${CURRENT_RANGE}`).then(r => r.json())
-        .then(ispLoad => updateWanMetricsChart(ispLoad))
-        .catch(err => console.error('Failed to load WAN metrics:', err));
-    }
-
-    function startPolling() {
-      if (pollTimer === null) pollTimer = setInterval(loadData, REFRESH_MS);
-      if (wanMetricsPollTimer === null) wanMetricsPollTimer = setInterval(loadWanMetrics, ISP_LOAD_REFRESH_MS);
-    }
-
-    function stopPolling() {
-      if (pollTimer !== null) { clearInterval(pollTimer); pollTimer = null; }
-      if (wanMetricsPollTimer !== null) { clearInterval(wanMetricsPollTimer); wanMetricsPollTimer = null; }
-    }
-
-    function truncateDatabase() {
-      const typed = window.prompt(
-        'This will PERMANENTLY DELETE all ping history, degradation windows, and failover event records -- the chart, table, and CSV export data. This cannot be undone. It does NOT affect which WAN is currently active. Type DELETE (in capitals) to confirm:'
-      );
-      if (typed !== 'DELETE') {
-        if (typed !== null) alert('Confirmation text did not match -- nothing was deleted.');
-        return;
-      }
-
-      const btn = document.getElementById('truncate-db-btn');
-      btn.disabled = true;
-      btn.textContent = 'Truncating...';
-
-      fetch('/api/database/truncate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ confirm: true }),
-      }).then(r => r.json()).then(data => {
-        btn.disabled = false;
-        btn.textContent = 'Truncate Database';
-        if (data.success) {
-          loadData();
-          loadWanMetrics();
-        } else {
-          alert('Truncate failed: ' + data.error);
-        }
-      }).catch(err => {
-        btn.disabled = false;
-        btn.textContent = 'Truncate Database';
-        alert('Truncate failed: ' + err);
-      });
-    }
-
-    function toggleTheme() {
-      const html = document.documentElement;
-      const current = html.getAttribute('data-theme') || 'dark';
-      const next = current === 'dark' ? 'light' : 'dark';
-      html.setAttribute('data-theme', next);
-      localStorage.setItem('wan-monitor-theme', next);
-      document.getElementById('theme-toggle-label').textContent = next === 'dark' ? 'Light mode' : 'Dark mode';
-
-      // Chart.js renders to canvas, so it can't pick up new CSS variable
-      // values on its own the way the rest of the page does -- destroy and
-      // rebuild every chart instance so they're recreated reading the new
-      // theme's colors. Toggling is a rare, deliberate user action, so the
-      // extra rebuild cost here is a non-issue -- much simpler and more
-      // reliable than trying to surgically patch every live chart's option
-      // objects in place.
-      if (chartInstance) { chartInstance.destroy(); chartInstance = null; }
-      Object.values(wanPortChartInstances).forEach(c => c.destroy());
-      wanPortChartInstances = {};
-      wanPortTabsBuilt = false;  // forces buildWanPortTabs() to rebuild tab/canvas DOM fresh too
-
-      loadData();
-      loadWanMetrics();
-    }
-
-    function toggleLive() {
-      liveEnabled = !liveEnabled;
-      const btn = document.getElementById('live-toggle-btn');
-      const indicator = document.getElementById('live-indicator');
-      const label = document.getElementById('live-toggle-label');
-      if (liveEnabled) {
-        startPolling();
-        loadData();       // refresh immediately on resume, don't wait for the next interval tick
-        loadWanMetrics();
-        btn.className = 'live'; indicator.className = 'live'; label.textContent = 'Live';
-      } else {
-        stopPolling();
-        btn.className = 'paused'; indicator.className = 'paused'; label.textContent = 'Paused';
-      }
-    }
-
-    // Sync the toggle button's label to whatever theme the head-level
-    // inline script already applied (saved preference or OS default) --
-    // its static HTML text doesn't know which theme actually won.
-    document.getElementById('theme-toggle-label').textContent =
-      document.documentElement.getAttribute('data-theme') === 'dark' ? 'Light mode' : 'Dark mode';
-
-    loadData();
-    loadWanMetrics();
-    startPolling();
-    loadWanPortsForSpeedTest();
-  </script>
-</body>
-</html>
-"""
 
 
 def _since_ts(range_key: str) -> float:
     seconds = RANGE_OPTIONS.get(range_key, RANGE_OPTIONS["24h"])
     return time.time() - seconds
+
+
+def display_port_name(port_ref, api_name: str) -> str:
+    """
+    Resolves the user-facing name for a WAN port: the user-configured label
+    (WAN_PRIMARY_LABEL / WAN_BACKUP_LABEL) if one is set, otherwise the
+    router-reported name (api_name) unchanged.
+
+    port_ref may be either the full portId string ("1_8ff0...") as used by
+    ports-config/load-balance, or a bare integer port number as used by
+    isp-load -- matching handles both by comparing against the configured
+    WAN_*_PORT_ID and its leading integer.
+
+    Deliberately reads config at call time (not module import), which makes
+    label changes apply LIVE on the next poll with no restart -- cheap
+    enough (one small sqlite lookup per key) at this dashboard's request
+    rates, and the one place live behavior is safe since it's purely
+    cosmetic.
+    """
+    primary_id = get_config("WAN_PRIMARY_PORT_ID") or ""
+    backup_id = get_config("WAN_BACKUP_PORT_ID") or ""
+
+    def matches(configured_id: str) -> bool:
+        if not configured_id:
+            return False
+        if str(port_ref) == configured_id:
+            return True
+        # isp-load reports bare integer port numbers; ports-config ids are
+        # "N_hash" -- compare against the leading integer too.
+        try:
+            return str(port_ref) == configured_id.split("_")[0]
+        except (AttributeError, IndexError):
+            return False
+
+    if matches(primary_id):
+        label = get_config("WAN_PRIMARY_LABEL")
+        if label:
+            return label
+    elif matches(backup_id):
+        label = get_config("WAN_BACKUP_LABEL")
+        if label:
+            return label
+    return api_name
 
 
 def _fmt(ts: float) -> str:
@@ -926,14 +145,115 @@ def index():
     if selected_range not in RANGE_OPTIONS:
         selected_range = "24h"
 
-    return render_template_string(
-        PAGE,
+    return render_template(
+        "dashboard.html",
         ranges=list(RANGE_OPTIONS.keys()),
         selected_range=selected_range,
         dashboard_timezone=DASHBOARD_TIMEZONE,
         refresh_interval_seconds=REFRESH_INTERVAL_SECONDS,
         isp_load_refresh_interval_seconds=ISP_LOAD_REFRESH_INTERVAL_SECONDS,
     )
+
+
+@app.route("/docs")
+def docs():
+    return render_template("docs.html")
+
+
+@app.route("/configuration")
+def configuration():
+    all_settings = list_settings_for_ui()
+    # SETTINGS_REGISTRY (and therefore list_settings_for_ui(), which walks
+    # it in order) is already grouped into contiguous same-section blocks --
+    # groupby only needs contiguous runs, not a full sort, and this
+    # preserves the registry's intentional section ordering rather than
+    # alphabetizing it.
+    sections = [
+        (section_name, list(fields))
+        for section_name, fields in itertools.groupby(all_settings, key=lambda f: f["section"])
+    ]
+    return render_template("configuration.html", sections=sections)
+
+
+@app.route("/api/config/save", methods=["POST"])
+def api_config_save():
+    """
+    Saves one or more settings as database overrides. Only accepts keys
+    that actually exist in SETTINGS_REGISTRY -- silently ignores anything
+    else, rather than letting an arbitrary key get written into settings.db
+    (defense against a malformed/malicious request body, even though this
+    is a local trusted dashboard).
+    """
+    body = request.get_json(silent=True) or {}
+    values = body.get("values", {})
+    if not isinstance(values, dict):
+        return jsonify({"success": False, "error": "'values' must be an object"}), 400
+
+    valid_keys = {entry["key"] for entry in SETTINGS_REGISTRY}
+    saved_count = 0
+    try:
+        for key, value in values.items():
+            if key not in valid_keys:
+                log.warning("Ignoring unknown config key in save request: %s", key)
+                continue
+            settings_store.set_setting(key, value)
+            saved_count += 1
+        return jsonify({"success": True, "error": None, "saved_count": saved_count})
+    except Exception as e:
+        log.warning("Failed to save configuration: %s", e)
+        return jsonify({"success": False, "error": str(e)})
+
+
+@app.route("/api/config/reset", methods=["POST"])
+def api_config_reset():
+    """Deletes every saved override -- the Configuration tab's Danger Zone.
+    Reverts everything to .env/default; does NOT touch .env itself or the
+    monitoring database (cycles/events/monitor_state)."""
+    body = request.get_json(silent=True) or {}
+    if not body.get("confirm"):
+        return jsonify({"success": False, "error": "Missing confirmation"}), 400
+
+    try:
+        settings_store.delete_all_settings()
+        return jsonify({"success": True, "error": None})
+    except Exception as e:
+        log.warning("Failed to reset configuration: %s", e)
+        return jsonify({"success": False, "error": str(e)})
+
+
+def _schedule_self_exit(delay_seconds: float = 0.7):
+    """Exits this process shortly after the current request finishes, so
+    the HTTP response gets flushed to the client first. Docker's
+    `restart: unless-stopped` policy restarts the container, and the fresh
+    process reads current config. Split into its own function so tests can
+    monkeypatch it instead of actually killing the test runner."""
+    import threading
+    threading.Timer(delay_seconds, lambda: os._exit(0)).start()
+
+
+@app.route("/api/restart", methods=["POST"])
+def api_restart():
+    """
+    The Configuration page's "Apply & Restart" action -- restarts BOTH
+    services so saved configuration takes effect, without the user touching
+    docker: writes the restart flag to the shared settings db (monitor.py
+    sees it within one check cycle, ~CHECK_INTERVAL_SECONDS, and exits
+    cleanly), then exits this dashboard process itself just after the
+    response flushes. Docker's restart policy brings both back with fresh
+    config. Requires {"confirm": true}, same pattern as every other
+    state-changing endpoint here.
+    """
+    body = request.get_json(silent=True) or {}
+    if not body.get("confirm"):
+        return jsonify({"success": False, "error": "Missing confirmation"}), 400
+
+    try:
+        settings_store.request_restart()
+        _schedule_self_exit()
+        return jsonify({"success": True, "error": None})
+    except Exception as e:
+        log.warning("Failed to initiate restart: %s", e)
+        return jsonify({"success": False, "error": str(e)})
 
 
 @app.route("/api/cycles")
@@ -1022,6 +342,10 @@ def api_isp_load():
 
     try:
         result = client.get_isp_load(int(since), int(now))
+        # Apply user-configured display labels (isp-load's portId is a bare
+        # integer, which display_port_name handles by leading-int match)
+        for port in result:
+            port["portName"] = display_port_name(port.get("portId"), port.get("portName", ""))
         return jsonify({"ports": result, "error": None})
     except Exception as e:
         log.warning("Failed to fetch ISP load: %s", e)
@@ -1039,7 +363,7 @@ def api_wan_ports():
     try:
         result = client.get_wan_ports_config()
         ports = [
-            {"portId": p["portId"], "portName": p["portName"]}
+            {"portId": p["portId"], "portName": display_port_name(p["portId"], p["portName"])}
             for p in result.get("wanPortsConfig", [])
         ]
         return jsonify({"ports": ports, "error": None})
@@ -1060,7 +384,7 @@ def api_device_capabilities():
     if client is None:
         return jsonify({"speedTestSupported": None, "error": _omada_client_error})
 
-    gateway_mac = os.environ.get("OMADA_GATEWAY_MAC", "")
+    gateway_mac = get_config("OMADA_GATEWAY_MAC")
     if not gateway_mac:
         return jsonify({"speedTestSupported": None, "error": "OMADA_GATEWAY_MAC not configured"})
 
@@ -1079,7 +403,7 @@ def api_speedtest_start():
     if client is None:
         return jsonify({"success": False, "error": _omada_client_error})
 
-    gateway_mac = os.environ.get("OMADA_GATEWAY_MAC", "")
+    gateway_mac = get_config("OMADA_GATEWAY_MAC")
     if not gateway_mac:
         return jsonify({"success": False, "error": "OMADA_GATEWAY_MAC not configured"})
 
@@ -1102,7 +426,7 @@ def api_speedtest_result():
     if client is None:
         return jsonify({"result": None, "error": _omada_client_error})
 
-    gateway_mac = os.environ.get("OMADA_GATEWAY_MAC", "")
+    gateway_mac = get_config("OMADA_GATEWAY_MAC")
     if not gateway_mac:
         return jsonify({"result": None, "error": "OMADA_GATEWAY_MAC not configured"})
 
@@ -1129,7 +453,7 @@ def api_active_wan():
     try:
         lb = client.get_internet_load_balance()
         wan_config = client.get_wan_ports_config()
-        name_by_id = {p["portId"]: p["portName"] for p in wan_config.get("wanPortsConfig", [])}
+        name_by_id = {p["portId"]: display_port_name(p["portId"], p["portName"]) for p in wan_config.get("wanPortsConfig", [])}
         primary_id = (lb.get("primaryWans") or [None])[0]
         backup_id = lb.get("backupWan")
         return jsonify({
@@ -1235,5 +559,5 @@ def report_csv():
 
 if __name__ == "__main__":
     db.init_db()
-    port = int(os.environ.get("DASHBOARD_PORT", "8090"))
+    port = get_config("DASHBOARD_PORT")
     app.run(host="0.0.0.0", port=port)
